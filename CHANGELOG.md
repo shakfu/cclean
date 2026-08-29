@@ -12,6 +12,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - `--build-artifacts` covers 25 directory and marker pairs, up from 2: JavaScript and TypeScript (`dist`, `build`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`), JVM (`target`, `build`, `.gradle`), Python (`build`, `dist`), Zig, Swift, Elixir, Dart, and Meson alongside the existing CMake and Cargo. A marker licenses only the directory it is paired with, so `package.json` beside a `target/` does not qualify it. `node_modules` is left out: it is dependencies rather than build output, and restoring it needs the network.
 
+### Fixed
+
+- `--build-artifacts` matched build directories inside nested repositories. A git submodule or a vendored checkout carries its own `.git` and marker file, so it satisfied the test on its own: on one project this took `lib/DaisySP/build`, `lib/DaisySP/DaisySP-LGPL/build` and `lib/libDaisy/build` alongside the intended top-level `build`. An artifact directory now also requires that nothing between it and `ROOT` is a repository. Naming the nested project as `ROOT` still cleans it.
+
 ### Changed
 
 - `.venv` and `venv` are no longer protected, leaving `.git`, `.hg`, `.svn`, `.config`, `.ssh`, `.gnupg`. A virtual environment holds the largest concentration of `__pycache__` in a typical Python project, so protecting it gave up most of what a default run is for, and recovering it needed `--no-skip`, which also unprotects `.git` and `.ssh`. The rest of the list is state managed by another tool, where a name match is likelier to be a false positive than a cache; a virtual environment's caches are ordinary Python caches.

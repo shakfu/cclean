@@ -749,9 +749,36 @@ static bool has_entry(const fs::path& directory, std::string_view name) {
 // "build" and "target" are ordinary names, so they only count as artifacts
 // beside the marker files of a project that generates one. The .git test is
 // what keeps a stray directory called build out of the list.
+// True when a directory between `project` and ROOT is itself a repository.
+// A submodule or a vendored checkout carries its own .git and marker file, so
+// without this its build output matches even though it sits well below the top
+// level of the project being cleaned.
+static bool has_enclosing_project(fs::path project, const fs::path& root) {
+    const fs::path stop = root.lexically_normal();
+    project = project.lexically_normal();
+
+    while (project != stop) {
+        const fs::path parent = project.parent_path();
+
+        if (parent.empty() || parent == project) {
+            // Ran out of path before reaching ROOT.
+            return false;
+        }
+
+        project = parent;
+
+        if (has_entry(project, ".git")) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static bool is_artifact_directory(
     const fs::path& directory,
-    const std::string& name)
+    const std::string& name,
+    const fs::path& root)
 {
     // Name first: it costs a few string compares, where the marker tests below
     // each cost a stat.
@@ -771,6 +798,11 @@ static bool is_artifact_directory(
     const fs::path project = directory.parent_path();
 
     if (!has_entry(project, ".git")) {
+        return false;
+    }
+
+    // The artifact must sit at the top level of the outermost project.
+    if (has_enclosing_project(project, root)) {
         return false;
     }
 
@@ -875,7 +907,7 @@ static void scan_tree(
 
                 if (!matches_any(path, root, filename, patterns) &&
                     !(build_artifacts && is_directory &&
-                      is_artifact_directory(path, filename))) {
+                      is_artifact_directory(path, filename, root))) {
                     // Symlinks are never followed, so only a real directory
                     // is worth queueing.
                     if (is_directory) {

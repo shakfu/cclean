@@ -135,6 +135,8 @@ Symbolic links are never followed. A matched link is removed as a link, and coun
 
 A marker only licenses the directory it is paired with: `package.json` beside a `target/` does not qualify it, and `Cargo.toml` beside a `dist/` does not either. A `build/` directory without a `.git` beside it is an ordinary directory and is left alone.
 
+The directory must also be top-level in the outermost project. A submodule or a vendored checkout carries its own `.git` and marker file, so its `build/` would otherwise qualify on its own; if anything between it and `ROOT` is a repository, it is skipped. Name the nested project as `ROOT` to clean it directly.
+
 `node_modules/` is deliberately absent. It is dependencies rather than build output, and restoring it needs the network, where everything above rebuilds offline. Remove it with a pattern if you want to: `cclean . node_modules`. A separate `--dependencies` flag is in `TODO.md`.
 
 The `.git` requirement is literal, so a monorepo is not detected: a crate at `repo/rust-app/` with the repository's `.git` one level up will not match.

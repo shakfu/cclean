@@ -13,7 +13,7 @@
 
 ## Known limitations
 
-- [ ] **Monorepos are not detected by `--build-artifacts`**: the `.git` requirement is literal, so a crate at `repo/rust-app/` whose repository `.git` sits one level up does not match. Fixing it means searching upward for `.git` instead of requiring it as a sibling.
+- [ ] **Monorepos are not detected by `--build-artifacts`**: the `.git` requirement is literal, so a crate at `repo/rust-app/` whose repository `.git` sits one level up does not match. Fixing it means searching upward for `.git` instead of requiring it as a sibling, which has to be reconciled with the rule that an artifact must be top-level in the outermost project: an upward search would find the monorepo root for a nested crate, but must not do so for a submodule.
 
 - [ ] **Unreadable directories are skipped silently**: `skip_permission_denied` suppresses the error, so neither the walk nor an unreadable `ROOT` reports anything. An unreadable `ROOT` exits 0 with "No matching targets found" rather than failing.
 

@@ -390,6 +390,38 @@ check "-b requires a marker" 0 "$("$CCLEAN" -n -b "$d" | grep -c 'nomarker')"
 check "-b pairs the marker with its own directory" 0 \
       "$("$CCLEAN" -n -b "$d" | grep -c 'crossed')"
 
+# A submodule carries its own .git and marker file. Its build output is not
+# top-level in the project being cleaned, so it must not match. This is the
+# layout of sk-engines/lib/DaisySP and friends.
+d=$WORK/submodules
+rm -rf "$d"
+mkdir -p "$d/outer/.git" "$d/outer/build" "$d/outer/lib/vendored/build"
+printf 'x' > "$d/outer/CMakeLists.txt"
+printf 'AA' > "$d/outer/build/out"
+printf 'gitdir: ../../.git/modules/vendored' > "$d/outer/lib/vendored/.git"
+printf 'x' > "$d/outer/lib/vendored/CMakeLists.txt"
+printf 'BBBB' > "$d/outer/lib/vendored/build/out"
+
+# A vendored checkout with a real .git directory, same rule.
+mkdir -p "$d/outer/third_party/lib/.git" "$d/outer/third_party/lib/build"
+printf 'x' > "$d/outer/third_party/lib/CMakeLists.txt"
+printf 'CCCCCC' > "$d/outer/third_party/lib/build/out"
+
+check "only the top-level build matches" "1 target, 2 B to reclaim" \
+      "$("$CCLEAN" -n -b "$d" | grep 'to reclaim')"
+check "a submodule build does not match" 0 \
+      "$("$CCLEAN" -n -b "$d" | grep -c 'vendored')"
+check "a nested checkout build does not match" 0 \
+      "$("$CCLEAN" -n -b "$d" | grep -c 'third_party')"
+
+# Naming the nested project as ROOT makes its build top-level again.
+check "the nested build matches when named as ROOT" "1 target, 4 B to reclaim" \
+      "$("$CCLEAN" -n -b "$d/outer/lib/vendored" | grep 'to reclaim')"
+
+# ROOT inside the repository still cleans that repository's own build.
+check "ROOT at the project cleans its build" "1 target, 2 B to reclaim" \
+      "$("$CCLEAN" -n -b "$d/outer" | grep 'to reclaim')"
+
 check "--exclude applies to artifacts too" 0 \
       "$("$CCLEAN" -n -b "$d" -e "**/next/**" -e next | grep -c '/next/')"
 

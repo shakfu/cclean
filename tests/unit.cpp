@@ -444,43 +444,43 @@ void test_artifact_detection() {
 
     const fs::path cmake =
         tree.project("cmake", "build", {".git", "CMakeLists.txt"});
-    CHECK(is_artifact_directory(cmake, "build"));
+    CHECK(is_artifact_directory(cmake, "build", tree.root()));
 
     const fs::path cargo =
         tree.project("cargo", "target", {".git", "Cargo.toml"});
-    CHECK(is_artifact_directory(cargo, "target"));
+    CHECK(is_artifact_directory(cargo, "target", tree.root()));
 
     // Cargo.lock is not required.
     const fs::path locked =
         tree.project("locked", "target", {".git", "Cargo.toml", "Cargo.lock"});
-    CHECK(is_artifact_directory(locked, "target"));
+    CHECK(is_artifact_directory(locked, "target", tree.root()));
 
     // Each guard on its own.
     const fs::path no_git = tree.project("no_git", "build", {"CMakeLists.txt"});
-    CHECK(!is_artifact_directory(no_git, "build"));
+    CHECK(!is_artifact_directory(no_git, "build", tree.root()));
 
     const fs::path no_marker = tree.project("no_marker", "build", {".git"});
-    CHECK(!is_artifact_directory(no_marker, "build"));
+    CHECK(!is_artifact_directory(no_marker, "build", tree.root()));
 
     const fs::path lock_only =
         tree.project("lock_only", "target", {".git", "Cargo.lock"});
-    CHECK(!is_artifact_directory(lock_only, "target"));
+    CHECK(!is_artifact_directory(lock_only, "target", tree.root()));
 
     // The marker must match the artifact: CMakeLists.txt does not license a
     // target/, and Cargo.toml does not license a build/.
     const fs::path crossed =
         tree.project("crossed", "target", {".git", "CMakeLists.txt"});
-    CHECK(!is_artifact_directory(crossed, "target"));
+    CHECK(!is_artifact_directory(crossed, "target", tree.root()));
 
     const fs::path crossed_two =
         tree.project("crossed_two", "build", {".git", "Cargo.toml"});
-    CHECK(!is_artifact_directory(crossed_two, "build"));
+    CHECK(!is_artifact_directory(crossed_two, "build", tree.root()));
 
     // Only these two names are ever considered.
     const fs::path other =
         tree.project("other", "output", {".git", "CMakeLists.txt"});
-    CHECK(!is_artifact_directory(other, "output"));
-    CHECK(!is_artifact_directory(cmake, "dist"));
+    CHECK(!is_artifact_directory(other, "output", tree.root()));
+    CHECK(!is_artifact_directory(cmake, "dist", tree.root()));
 
     // One directory name, several ecosystems. Each marker licenses only the
     // directory it is paired with.
@@ -506,7 +506,7 @@ void test_artifact_detection() {
     for (const Case& c : supported) {
         const std::string name = "case" + std::to_string(index++);
         const fs::path made = tree.project(name, c.dir, {".git", c.marker});
-        CHECK(is_artifact_directory(made, c.dir));
+        CHECK(is_artifact_directory(made, c.dir, tree.root()));
     }
 
     // Every pair in the table is covered above.
@@ -516,18 +516,45 @@ void test_artifact_detection() {
     // A marker does not license a directory it is not paired with.
     const fs::path wrong_pair =
         tree.project("wrong_pair", "target", {".git", "package.json"});
-    CHECK(!is_artifact_directory(wrong_pair, "target"));
+    CHECK(!is_artifact_directory(wrong_pair, "target", tree.root()));
 
     const fs::path wrong_pair_two =
         tree.project("wrong_pair_two", "zig-out", {".git", "Cargo.toml"});
-    CHECK(!is_artifact_directory(wrong_pair_two, "zig-out"));
+    CHECK(!is_artifact_directory(wrong_pair_two, "zig-out", tree.root()));
+
+    // A nested repository's build output belongs to a deeper level than the
+    // one being cleaned. This is the shape of a git submodule: the outer
+    // project has .git and a marker, and so does the inner one.
+    const fs::path outer = tree.root() / "outer";
+    fs::create_directories(outer / ".git");
+    fs::create_directories(outer / "build");
+    std::ofstream(outer / "CMakeLists.txt") << "x";
+
+    const fs::path inner = outer / "lib" / "vendored";
+    fs::create_directories(inner / "build");
+    std::ofstream(inner / ".git") << "gitdir: ../../.git/modules/vendored";
+    std::ofstream(inner / "CMakeLists.txt") << "x";
+
+    CHECK(is_artifact_directory(outer / "build", "build", tree.root()));
+    CHECK(!is_artifact_directory(inner / "build", "build", tree.root()));
+
+    // Pointing ROOT at the nested project makes it the top level again.
+    CHECK(is_artifact_directory(inner / "build", "build", inner));
+
+    // Depth alone is not the test: a project several levels below ROOT still
+    // qualifies, as long as nothing between it and ROOT is a repository.
+    const fs::path deep = tree.root() / "a" / "b" / "c";
+    fs::create_directories(deep / ".git");
+    fs::create_directories(deep / "build");
+    std::ofstream(deep / "CMakeLists.txt") << "x";
+    CHECK(is_artifact_directory(deep / "build", "build", tree.root()));
 
     // A .git file, as submodules and worktrees use, counts like a directory.
     const fs::path submodule = tree.root() / "submodule";
     fs::create_directories(submodule / "build");
     std::ofstream(submodule / ".git") << "gitdir: ../.git/modules/x";
     std::ofstream(submodule / "CMakeLists.txt") << "x";
-    CHECK(is_artifact_directory(submodule / "build", "build"));
+    CHECK(is_artifact_directory(submodule / "build", "build", tree.root()));
 }
 
 }  // namespace
