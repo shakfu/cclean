@@ -291,11 +291,14 @@ void test_skip_list() {
     CHECK(is_skipped(".git"));
     CHECK(is_skipped(".hg"));
     CHECK(is_skipped(".svn"));
-    CHECK(is_skipped(".venv"));
-    CHECK(is_skipped("venv"));
     CHECK(is_skipped(".config"));
     CHECK(is_skipped(".ssh"));
     CHECK(is_skipped(".gnupg"));
+
+    // Virtual environments are walked: they hold the largest concentration
+    // of __pycache__ in a typical Python project.
+    CHECK(!is_skipped(".venv"));
+    CHECK(!is_skipped("venv"));
 
     CHECK(!is_skipped("git"));
     CHECK(!is_skipped(".gitignore"));
@@ -338,6 +341,24 @@ void test_pattern_scope() {
     CHECK(!matches_any("/r/src/build/obj", root, "obj", nested));
 
     CHECK(matches_any(path, root, filename, {}) == false);
+}
+
+// Excludes are ordinary globs given the same scope as command-line patterns.
+// What differs is where the walk applies them, which the command-line suite
+// covers; here only the matching is checked.
+void test_exclude_scope() {
+    group("exclude scope");
+
+    std::vector<Glob> excludes;
+    excludes.emplace_back(".venv", Glob::Scope::NameOrPath);
+    excludes.emplace_back("**/fixtures/**", Glob::Scope::NameOrPath);
+
+    const fs::path root = "/r";
+
+    CHECK(matches_any("/r/.venv", root, ".venv", excludes));
+    CHECK(matches_any("/r/a/tests/fixtures/x", root, "x", excludes));
+    CHECK(!matches_any("/r/src", root, "src", excludes));
+    CHECK(!matches_any("/r/venv", root, "venv", excludes));
 }
 
 // ------------------------------------------------------------- sizing
@@ -461,6 +482,46 @@ void test_artifact_detection() {
     CHECK(!is_artifact_directory(other, "output"));
     CHECK(!is_artifact_directory(cmake, "dist"));
 
+    // One directory name, several ecosystems. Each marker licenses only the
+    // directory it is paired with.
+    struct Case { const char* dir; const char* marker; };
+    const Case supported[] = {
+        {"build", "CMakeLists.txt"}, {"build", "meson.build"},
+        {"build", "package.json"},   {"build", "build.gradle"},
+        {"build", "build.gradle.kts"}, {"build", "pyproject.toml"},
+        {"build", "setup.py"},       {"build", "pubspec.yaml"},
+        {"target", "Cargo.toml"},    {"target", "pom.xml"},
+        {"dist", "package.json"},    {"dist", "pyproject.toml"},
+        {"dist", "setup.py"},        {".next", "package.json"},
+        {".nuxt", "package.json"},   {".svelte-kit", "package.json"},
+        {".turbo", "package.json"},  {".parcel-cache", "package.json"},
+        {".gradle", "build.gradle"}, {".gradle", "build.gradle.kts"},
+        {"zig-out", "build.zig"},    {"zig-cache", "build.zig"},
+        {".zig-cache", "build.zig"}, {".build", "Package.swift"},
+        {"_build", "mix.exs"},
+    };
+
+    int index = 0;
+
+    for (const Case& c : supported) {
+        const std::string name = "case" + std::to_string(index++);
+        const fs::path made = tree.project(name, c.dir, {".git", c.marker});
+        CHECK(is_artifact_directory(made, c.dir));
+    }
+
+    // Every pair in the table is covered above.
+    CHECK_EQ(sizeof(supported) / sizeof(supported[0]),
+             defaults::artifacts.size());
+
+    // A marker does not license a directory it is not paired with.
+    const fs::path wrong_pair =
+        tree.project("wrong_pair", "target", {".git", "package.json"});
+    CHECK(!is_artifact_directory(wrong_pair, "target"));
+
+    const fs::path wrong_pair_two =
+        tree.project("wrong_pair_two", "zig-out", {".git", "Cargo.toml"});
+    CHECK(!is_artifact_directory(wrong_pair_two, "zig-out"));
+
     // A .git file, as submodules and worktrees use, counts like a directory.
     const fs::path submodule = tree.root() / "submodule";
     fs::create_directories(submodule / "build");
@@ -485,6 +546,7 @@ int main() {
     test_defaults_are_wired_up();
     test_skip_list();
     test_pattern_scope();
+    test_exclude_scope();
     test_format_size();
     test_saturating_add();
     test_artifact_detection();

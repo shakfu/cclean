@@ -18,6 +18,10 @@
 #include <termios.h>
 #include <unistd.h>
 
+#ifndef CCLEAN_VERSION
+#define CCLEAN_VERSION "unknown"
+#endif
+
 namespace fs = std::filesystem;
 
 namespace defaults {
@@ -33,16 +37,68 @@ constexpr std::array<std::string_view, 5> patterns = {
     ".DS_Store"
 };
 
+// Build output that --build-artifacts may remove. A directory qualifies when
+// its name appears here and the paired marker file sits beside it, inside a
+// project marked by .git. Several ecosystems build into the same directory
+// name, so one name carries several markers.
+struct Artifact {
+    std::string_view directory;
+    std::string_view marker;
+};
+
+constexpr std::array<Artifact, 25> artifacts = {{
+    // C and C++
+    {"build", "CMakeLists.txt"},
+    {"build", "meson.build"},
+
+    // Rust
+    {"target", "Cargo.toml"},
+
+    // JavaScript and TypeScript
+    {"build", "package.json"},
+    {"dist", "package.json"},
+    {".next", "package.json"},
+    {".nuxt", "package.json"},
+    {".svelte-kit", "package.json"},
+    {".turbo", "package.json"},
+    {".parcel-cache", "package.json"},
+
+    // JVM
+    {"target", "pom.xml"},
+    {"build", "build.gradle"},
+    {"build", "build.gradle.kts"},
+    {".gradle", "build.gradle"},
+    {".gradle", "build.gradle.kts"},
+
+    // Python
+    {"build", "pyproject.toml"},
+    {"dist", "pyproject.toml"},
+    {"build", "setup.py"},
+    {"dist", "setup.py"},
+
+    // Zig
+    {"zig-out", "build.zig"},
+    {"zig-cache", "build.zig"},
+    {".zig-cache", "build.zig"},
+
+    // Swift
+    {".build", "Package.swift"},
+
+    // Elixir
+    {"_build", "mix.exs"},
+
+    // Dart and Flutter
+    {"build", "pubspec.yaml"}
+}};
+
 // Never matched and never descended into. Their contents are state managed
 // by another tool, where a name match is far likelier to be a false positive
 // than a cache, and a wrong deletion costs history, credentials, or a working
 // environment. --no-skip walks them anyway.
-constexpr std::array<std::string_view, 8> skipped = {
+constexpr std::array<std::string_view, 6> skipped = {
     ".git",
     ".hg",
     ".svn",
-    ".venv",
-    "venv",
     ".config",
     ".ssh",
     ".gnupg"
@@ -685,9 +741,9 @@ static bool matches_any(
     return false;
 }
 
-static bool has_entry(const fs::path& directory, const char* name) {
+static bool has_entry(const fs::path& directory, std::string_view name) {
     std::error_code ec;
-    return fs::exists(directory / name, ec);
+    return fs::exists(directory / std::string(name), ec);
 }
 
 // "build" and "target" are ordinary names, so they only count as artifacts
@@ -697,10 +753,18 @@ static bool is_artifact_directory(
     const fs::path& directory,
     const std::string& name)
 {
-    const bool cmake = name == "build";
-    const bool cargo = name == "target";
+    // Name first: it costs a few string compares, where the marker tests below
+    // each cost a stat.
+    bool named = false;
 
-    if (!cmake && !cargo) {
+    for (const defaults::Artifact& artifact : defaults::artifacts) {
+        if (artifact.directory == name) {
+            named = true;
+            break;
+        }
+    }
+
+    if (!named) {
         return false;
     }
 
@@ -710,11 +774,14 @@ static bool is_artifact_directory(
         return false;
     }
 
-    if (cmake) {
-        return has_entry(project, "CMakeLists.txt");
+    for (const defaults::Artifact& artifact : defaults::artifacts) {
+        if (artifact.directory == name &&
+            has_entry(project, artifact.marker)) {
+            return true;
+        }
     }
 
-    return has_entry(project, "Cargo.toml");
+    return false;
 }
 
 static bool is_skipped(const std::string& name) {
@@ -731,6 +798,7 @@ static bool is_skipped(const std::string& name) {
 static void scan_tree(
     const fs::path& root,
     const std::vector<Glob>& patterns,
+    const std::vector<Glob>& excludes,
     bool use_skips,
     bool build_artifacts,
     std::vector<Target>& targets,
@@ -790,6 +858,15 @@ static void scan_tree(
 
                 // Neither matched nor descended into: see defaults::skipped.
                 if (use_skips && is_skipped(filename)) {
+                    continue;
+                }
+
+                // --exclude prunes rather than only suppressing the match, so
+                // that naming a directory keeps everything under it. That is
+                // what lets --exclude .venv restore protection the built-in
+                // list no longer gives.
+                if (!excludes.empty() &&
+                    matches_any(path, root, filename, excludes)) {
                     continue;
                 }
 
@@ -854,6 +931,37 @@ static std::string builtin_patterns() {
     return list;
 }
 
+static std::string artifact_directories() {
+    std::vector<std::string_view> names;
+
+    for (const defaults::Artifact& artifact : defaults::artifacts) {
+        if (std::find(names.begin(), names.end(), artifact.directory) ==
+            names.end()) {
+            names.push_back(artifact.directory);
+        }
+    }
+
+    std::sort(names.begin(), names.end());
+
+    std::string list;
+    std::size_t column = 0;
+
+    for (const std::string_view name : names) {
+        if (column != 0 && column + 2 + name.size() > 68) {
+            list += "\n  ";
+            column = 0;
+        } else if (column != 0) {
+            list += "  ";
+            column += 2;
+        }
+
+        list += name;
+        column += name.size();
+    }
+
+    return list;
+}
+
 static std::string skipped_directories() {
     std::string list;
 
@@ -876,21 +984,28 @@ static void print_usage(const char* program) {
         << "Options:\n"
         << "  -n, --dry-run  List matching targets and exit without removing\n"
         << "  -b, --build-artifacts\n"
-        << "                 Also remove a project's build output: build/ in\n"
-        << "                 a CMake project, target/ in a Cargo one. Both\n"
-        << "                 require .git and the marker file alongside.\n"
+        << "                 Also remove a project's build output, listed\n"
+        << "                 below\n"
+        << "  -e, --exclude PATTERN\n"
+        << "                 Leave anything matching PATTERN alone, contents\n"
+        << "                 included. Repeatable\n"
         << "  -v, --verbose  Name every item as it is removed\n"
         << "  -h, --help     Show this text\n"
+        << "  -V, --version  Show the version and exit\n"
         << "  --no-defaults  Match only the patterns given on the command line\n"
         << "  --no-skip      Also descend into the skipped directories below\n"
         << "  --             Treat every later argument as ROOT or a pattern\n\n"
         << "Never matched or descended into, unless --no-skip is given:\n"
         << "  " << skipped_directories() << "\n\n"
+        << "Removed by --build-artifacts, when .git and the marker file for\n"
+        << "the ecosystem sit beside them:\n"
+        << "  " << artifact_directories() << "\n\n"
         << "Examples:\n"
         << "  " << program << "                       (scans the working directory)\n"
         << "  " << program << " ./project\n"
         << "  " << program << " --dry-run ./project \"*.log\" \"*.tmp\"\n"
-        << "  " << program << " --no-defaults . \"build/**\" \"**/*.o\"\n\n"
+        << "  " << program << " --no-defaults . \"build/**\" \"**/*.o\"\n"
+        << "  " << program << " --exclude .venv --exclude \"**/fixtures/**\"\n\n"
         << "Command-line patterns match either the path relative to ROOT or\n"
         << "the final filename; built-in patterns match the filename only.\n\n"
         << "Supported wildcards:\n"
@@ -905,6 +1020,7 @@ int main(int argc, char* argv[]) {
     bool use_skips = true;
     bool verbose = false;
     bool build_artifacts = false;
+    std::vector<std::string> exclude_patterns;
     bool options_ended = false;
     std::vector<std::string> operands;
 
@@ -946,6 +1062,27 @@ int main(int argc, char* argv[]) {
 
             if (argument == "-h" || argument == "--help") {
                 print_usage(argv[0]);
+                return 0;
+            }
+
+            if (argument == "-e" || argument == "--exclude") {
+                if (i + 1 >= argc) {
+                    std::cerr << argument << " needs a pattern.\n";
+                    return 2;
+                }
+
+                // Taken verbatim, so a pattern may itself begin with a dash.
+                exclude_patterns.push_back(argv[++i]);
+                continue;
+            }
+
+            if (argument.rfind("--exclude=", 0) == 0) {
+                exclude_patterns.push_back(argument.substr(10));
+                continue;
+            }
+
+            if (argument == "-V" || argument == "--version") {
+                std::cout << "cclean " << CCLEAN_VERSION << '\n';
                 return 0;
             }
 
@@ -992,6 +1129,13 @@ int main(int argc, char* argv[]) {
         patterns.emplace_back(operands[i], Glob::Scope::NameOrPath);
     }
 
+    std::vector<Glob> excludes;
+    excludes.reserve(exclude_patterns.size());
+
+    for (const std::string& pattern : exclude_patterns) {
+        excludes.emplace_back(pattern, Glob::Scope::NameOrPath);
+    }
+
     std::error_code ec;
     const fs::file_status root_status = fs::symlink_status(root, ec);
 
@@ -1025,7 +1169,7 @@ int main(int argc, char* argv[]) {
 
     Progress progress(is_terminal(STDERR_FILENO));
 
-    scan_tree(root, patterns, use_skips, build_artifacts,
+    scan_tree(root, patterns, excludes, use_skips, build_artifacts,
               targets, errors, progress);
 
     size_directories(targets, errors, progress);

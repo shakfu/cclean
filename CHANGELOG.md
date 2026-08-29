@@ -2,6 +2,20 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1]
+
+### Added
+
+- `-V, --version`. The number comes from `project(... VERSION ...)` in `CMakeLists.txt` and reaches the program as a compile definition, so it is written in one place. A build made outside CMake reports `unknown` rather than a number that would have to be kept in step by hand. The version does appear twice, here and in `CMakeLists.txt`, so a command-line test compares `--version` against the newest entry in this file.
+
+- `-e, --exclude PATTERN`, repeatable. An exclude prunes rather than only suppressing the match, so naming a directory keeps everything under it. rclean's equivalent suppresses only, which leaves the contents of an excluded directory still eligible; pruning is what lets `--exclude .venv` restore the protection this release removes. Excludes are scoped like command-line patterns and apply to built-in patterns, command-line patterns and `--build-artifacts` alike.
+
+- `--build-artifacts` covers 25 directory and marker pairs, up from 2: JavaScript and TypeScript (`dist`, `build`, `.next`, `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`), JVM (`target`, `build`, `.gradle`), Python (`build`, `dist`), Zig, Swift, Elixir, Dart, and Meson alongside the existing CMake and Cargo. A marker licenses only the directory it is paired with, so `package.json` beside a `target/` does not qualify it. `node_modules` is left out: it is dependencies rather than build output, and restoring it needs the network.
+
+### Changed
+
+- `.venv` and `venv` are no longer protected, leaving `.git`, `.hg`, `.svn`, `.config`, `.ssh`, `.gnupg`. A virtual environment holds the largest concentration of `__pycache__` in a typical Python project, so protecting it gave up most of what a default run is for, and recovering it needed `--no-skip`, which also unprotects `.git` and `.ssh`. The rest of the list is state managed by another tool, where a name match is likelier to be a false positive than a cache; a virtual environment's caches are ordinary Python caches.
+
 ## [0.1.0]
 
 First release. See `README.md` for usage.
@@ -32,4 +46,5 @@ Glob matching is open-coded rather than translated to `std::regex`. Regex was 25
 
 A matched directory is removed whole and is not descended into, so its contents appear in neither the walk nor the listing. Counting a directory and the matched files inside it separately doubles the reported total.
 
-[0.1.0]: https://github.com/shakfu/cclean/releases/tag/v0.1.0
+[0.1.1]: https://github.com/shakfu/cclean/releases/tag/0.1.1
+[0.1.0]: https://github.com/shakfu/cclean/releases/tag/0.1.0

@@ -117,19 +117,25 @@ rclean takes `--exclude` globs. cclean has only its protected list, so a pattern
 
 - Published on crates.io, with a changelog and an MIT license file. cclean has neither a license nor a release process.
 
-## Where they now agree
+## Where they mostly agree
 
 ### Protected directories
 
-Neither tool matches or descends into `.git`, `.hg`, `.svn`, `.venv`, `venv`, `.config`, `.ssh`, or `.gnupg`. rclean 0.4.0 adopted cclean's list.
+Both tools refuse to enter version-control metadata and user configuration. rclean 0.4.0 adopted cclean's list, which cclean 0.1.1 then shortened.
 
-Given a tree with a `.pyc` file in each of `.git/objects`, `.venv/lib`, `.ssh`, and `src`, plus a `src/__pycache__`, both match the same two items under `src`. Both also agree on two edges:
+| | cclean 0.1.1 | rclean 0.4.0 |
+|-|-|-|
+| `.git`, `.hg`, `.svn` | protected | protected |
+| `.config`, `.ssh`, `.gnupg` | protected | protected |
+| `.venv`, `venv` | walked | protected |
+
+Given a tree with a `.pyc` file in each of `.git/objects`, `.venv/lib`, `venv/lib`, `.ssh`, and `src`, cclean matches three items and rclean one: cclean cleans both virtual environments, and neither touches `.git` or `.ssh`. A virtual environment's `__pycache__` is an ordinary Python cache, and it is usually the largest concentration of them in a project; the rest of the list is state another tool owns. Both agree on two edges:
 
 - A protected directory named as the root is entered. Pointing either tool at `.git` is deliberate.
 
 - Protection is by name, whatever the entry type, so the `.git` *file* that marks a submodule is protected too.
 
-They differ only in how the list is overridden. cclean's is fixed, with `--no-skip` to disable it wholesale. rclean's `--no-protect` does the same for one run, and `protected_dirs` in a config file replaces the list, so a project can protect names of its own.
+They also differ in how the list is overridden. cclean's is fixed, with `--no-skip` to disable it wholesale. rclean's `--no-protect` does the same for one run, and `protected_dirs` in a config file replaces the list, so a project can protect names of its own. Anyone wanting cclean to leave virtual environments alone has no equivalent, which is the strongest argument for adding exclude patterns.
 
 ### Size estimates
 
@@ -171,10 +177,12 @@ In rough order of value:
 
 2. ~~A parallel walk.~~ Done: the walk and sizing now share one work-queue driver, and cclean is the faster of the two again.
 
-3. **Exclude patterns.** The one composition primitive rclean has that cclean cannot express at all.
+3. ~~Exclude patterns.~~ Done: `-e, --exclude`, which prunes rather than only suppressing the match.
 
 4. **A config file**, so a pattern set can live in a repository.
 
 5. **`--format json`**, worth doing only if the log-to-stdout mistake above is avoided.
+
+Remaining items are tracked in `TODO.md`, along with a `--dependencies` flag that has no rclean equivalent: rclean folds `node_modules` and `vendor` into its `node` and `go` presets.
 
 Presets are worth considering but overlap with cclean's `.*_cache` pattern, which already covers per-tool caches by shape rather than by name.

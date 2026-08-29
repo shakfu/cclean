@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(cclean
-    VERSION 0.1.0
+    VERSION 0.1.1
     DESCRIPTION "Removes build caches and editor debris from a directory tree"
     LANGUAGES CXX)
 
@@ -23,7 +23,10 @@ find_package(Threads REQUIRED)
 # it can be built with anyway.
 set(CCLEAN_WARNINGS -Wall -Wextra -pedantic)
 
+# The version reaches the program from here, so project() above is the only
+# place it is written.
 add_executable(cclean src/cclean.cpp)
+target_compile_definitions(cclean PRIVATE CCLEAN_VERSION="${PROJECT_VERSION}")
 target_compile_options(cclean PRIVATE ${CCLEAN_WARNINGS})
 target_link_libraries(cclean PRIVATE Threads::Threads)
 
@@ -38,6 +41,8 @@ if(CCLEAN_BUILD_TESTS)
     # which is how it reaches the static functions. It therefore reaches only
     # part of the file, hence -Wno-unused-function.
     add_executable(cclean_unit tests/unit.cpp)
+    target_compile_definitions(cclean_unit PRIVATE
+        CCLEAN_VERSION="${PROJECT_VERSION}")
     target_compile_options(cclean_unit PRIVATE
         ${CCLEAN_WARNINGS} -Wno-unused-function)
     target_link_libraries(cclean_unit PRIVATE Threads::Threads)

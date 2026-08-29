@@ -145,6 +145,22 @@ check "--help exits 0" 0 $?
 "$CCLEAN" --bogus >/dev/null 2>&1
 check "unknown option exits 2" 2 $?
 
+"$CCLEAN" --version >/dev/null 2>&1
+check "--version exits 0" 0 $?
+
+version=$("$CCLEAN" --version)
+check "--version names the program" "cclean" "${version%% *}"
+check "-V matches --version" "$version" "$("$CCLEAN" -V)"
+
+# The version is written once, in CMakeLists.txt, and reaches the program as a
+# compile definition. CHANGELOG.md repeats it, so guard the pair against drift.
+changelog=$(dirname "$0")/../CHANGELOG.md
+if [ -f "$changelog" ]; then
+    latest=$(sed -n 's/^## \[\([0-9][^]]*\)\].*/\1/p' "$changelog" | head -1)
+    check "--version matches the newest CHANGELOG entry" \
+          "cclean $latest" "$version"
+fi
+
 "$CCLEAN" -n --no-defaults "$WORK" >/dev/null 2>&1
 check "--no-defaults without a pattern exits 2" 2 $?
 
@@ -188,9 +204,8 @@ fi
 
 d=$WORK/skips
 rm -rf "$d"
-mkdir -p "$d/.git/objects" "$d/.venv/lib/__pycache__" "$d/.ssh" "$d/src/__pycache__"
+mkdir -p "$d/.git/objects" "$d/.ssh" "$d/src/__pycache__"
 printf 'a' > "$d/.git/objects/cached.pyc"
-printf 'b' > "$d/.venv/lib/__pycache__/m.pyc"
 printf 'c' > "$d/.ssh/id.pyc"
 printf 'd' > "$d/src/__pycache__/m.pyc"
 
@@ -198,13 +213,27 @@ check "skip list leaves one match" "1 target, 1 B to reclaim" \
       "$("$CCLEAN" -n "$d" | grep 'to reclaim')"
 
 check "protected directories are not entered" 0 \
-      "$("$CCLEAN" -n "$d" | grep -c '\.git\|\.ssh\|\.venv')"
+      "$("$CCLEAN" -n "$d" | grep -c '\.git\|\.ssh')"
 
-check "--no-skip enters them" 3 \
-      "$("$CCLEAN" -n --no-skip "$d" | grep -c '\.git\|\.ssh\|\.venv')"
+check "--no-skip enters them" 2 \
+      "$("$CCLEAN" -n --no-skip "$d" | grep -c '\.git\|\.ssh')"
 
 printf 'y' | "$CCLEAN" "$d" >/dev/null 2>&1
 check "protected content survives removal" 1 "$(count_files "$d/.git")"
+
+# Virtual environments are walked. They are where most of a Python project's
+# __pycache__ lives, so protecting them gave up most of what the tool is for.
+d=$WORK/venvs
+rm -rf "$d"
+mkdir -p "$d/.venv/lib/__pycache__" "$d/venv/lib/__pycache__"
+printf 'ab' > "$d/.venv/lib/__pycache__/m.pyc"
+printf 'cd' > "$d/venv/lib/__pycache__/m.pyc"
+
+check "virtual environments are cleaned" "2 targets, 4 B to reclaim" \
+      "$("$CCLEAN" -n "$d" | grep 'to reclaim')"
+
+printf 'y' | "$CCLEAN" "$d" >/dev/null 2>&1
+check "virtual environment caches are removed" 0 "$(count_files "$d")"
 
 # A pattern naming a protected directory still cannot reach it.
 d=$WORK/skips_explicit
@@ -280,6 +309,89 @@ check "-b ignores unmarked directories" 0 "$("$CCLEAN" -n -b "$d" | grep -c 'str
 printf 'y' | "$CCLEAN" -b "$d" >/dev/null 2>&1
 check "-b removes the build directory" 0 "$(count_files "$d/cmake/build")"
 check "-b leaves the marker file" 1 "$(count_files "$d/cmake" | tr -d ' ')"
+
+# --------------------------------------------------------------- excludes
+
+d=$WORK/excludes
+rm -rf "$d"
+mkdir -p "$d/src/__pycache__" "$d/.venv/lib/__pycache__" "$d/tests/fixtures/__pycache__"
+printf 'aa' > "$d/src/__pycache__/m.pyc"
+printf 'bb' > "$d/.venv/lib/__pycache__/m.pyc"
+printf 'cc' > "$d/tests/fixtures/__pycache__/m.pyc"
+printf 'd' > "$d/top.pyc"
+
+check "no excludes matches everything" "4 targets, 7 B to reclaim" \
+      "$("$CCLEAN" -n "$d" | grep 'to reclaim')"
+
+# An exclude prunes, so naming a directory keeps everything under it. This is
+# how a virtual environment is protected now that the built-in list does not.
+check "--exclude prunes the subtree" 0 \
+      "$("$CCLEAN" -n "$d" -e .venv | grep -c 'venv')"
+check "--exclude=VALUE form" 0 \
+      "$("$CCLEAN" -n "$d" --exclude=.venv | grep -c 'venv')"
+check "-e prunes a nested subtree" 0 \
+      "$("$CCLEAN" -n "$d" -e tests | grep -c 'fixtures')"
+# "*.pyc" excludes top.pyc; src/__pycache__ is claimed whole and its name
+# does not end in .pyc, so it survives the exclude and its 2 bytes remain.
+check "-e is repeatable" "1 target, 2 B to reclaim" \
+      "$("$CCLEAN" -n "$d" -e .venv -e tests -e "*.pyc" | grep 'to reclaim')"
+check "-e excludes a file" 0 \
+      "$("$CCLEAN" -n --no-defaults "$d" "*.pyc" -e top.pyc | grep -c 'top.pyc')"
+
+"$CCLEAN" -n "$d" -e >/dev/null 2>&1
+check "-e without a pattern exits 2" 2 $?
+"$CCLEAN" -n "$d" --exclude >/dev/null 2>&1
+check "--exclude without a pattern exits 2" 2 $?
+
+# The value is taken verbatim, so it may itself begin with a dash.
+"$CCLEAN" -n "$d" -e "-weird" >/dev/null 2>&1
+check "-e takes a dashed value verbatim" 0 $?
+
+printf 'y' | "$CCLEAN" "$d" -e .venv >/dev/null 2>&1
+check "excluded content survives removal" 1 "$(count_files "$d/.venv")"
+
+# ------------------------------------------------------- build ecosystems
+
+d=$WORK/ecosystems
+rm -rf "$d"
+# One project per ecosystem: .git, the marker file, and the artifact directory.
+for pair in "js:dist:package.json" "next:.next:package.json" \
+            "svelte:.svelte-kit:package.json" "cra:build:package.json" \
+            "gradle:build:build.gradle" "gradlekt:.gradle:build.gradle.kts" \
+            "maven:target:pom.xml" "py:dist:pyproject.toml" \
+            "pysetup:build:setup.py" "zig:zig-out:build.zig" \
+            "swift:.build:Package.swift" "elixir:_build:mix.exs" \
+            "flutter:build:pubspec.yaml" "meson:build:meson.build" \
+            "rust:target:Cargo.toml" "cmake:build:CMakeLists.txt"; do
+    name=${pair%%:*}
+    rest=${pair#*:}
+    art=${rest%%:*}
+    marker=${rest#*:}
+    mkdir -p "$d/$name/.git" "$d/$name/$art"
+    printf 'x' > "$d/$name/$marker"
+    printf 'yy' > "$d/$name/$art/out"
+done
+
+# Negatives: no .git, no marker, and a marker paired with the wrong directory.
+mkdir -p "$d/nogit/dist" && printf 'x' > "$d/nogit/package.json"
+printf 'yy' > "$d/nogit/dist/out"
+mkdir -p "$d/nomarker/.git" "$d/nomarker/dist" && printf 'yy' > "$d/nomarker/dist/out"
+mkdir -p "$d/crossed/.git" "$d/crossed/target" && printf 'x' > "$d/crossed/package.json"
+printf 'yy' > "$d/crossed/target/out"
+
+check "artifacts need -b" 0 \
+      "$("$CCLEAN" -n "$d" | grep -c 'out\|dist\|_build\|zig-out')"
+
+check "-b finds every ecosystem and no others" "16 targets, 32 B to reclaim" \
+      "$("$CCLEAN" -n -b "$d" | grep 'to reclaim')"
+
+check "-b requires .git" 0 "$("$CCLEAN" -n -b "$d" | grep -c 'nogit')"
+check "-b requires a marker" 0 "$("$CCLEAN" -n -b "$d" | grep -c 'nomarker')"
+check "-b pairs the marker with its own directory" 0 \
+      "$("$CCLEAN" -n -b "$d" | grep -c 'crossed')"
+
+check "--exclude applies to artifacts too" 0 \
+      "$("$CCLEAN" -n -b "$d" -e "**/next/**" -e next | grep -c '/next/')"
 
 # ----------------------------------------------------------- output shape
 
