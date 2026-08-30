@@ -5,9 +5,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <map>
+#include <optional>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -91,6 +94,30 @@ constexpr std::array<Artifact, 25> artifacts = {{
     {"build", "pubspec.yaml"}
 }};
 
+// Three ecosystems, not every ecosystem. A wrong entry here deletes a tree that
+// cannot be rebuilt, so the list stays where the restore command is known and
+// the layout is conventional. Anything else is a pattern in .cclean.toml.
+constexpr std::array<Artifact, 8> dependencies = {{
+    // uv.lock rather than pyproject.toml: the lock file is what makes the
+    // environment reproducible, and `uv sync` rebuilds it exactly. A bare
+    // pyproject.toml is also satisfied by poetry, pdm, hatch and by a .venv
+    // populated with pip, none of which restore to a known state.
+    {".venv", "uv.lock"},
+    // A lock file rather than package.json, which carries ranges: only the lock
+    // pins a tree. One row per package manager, because they share the install
+    // directory but not the lock name, and a name match on node_modules alone
+    // would take trees no lock can rebuild.
+    {"node_modules", "package-lock.json"},
+    {"node_modules", "npm-shrinkwrap.json"},
+    {"node_modules", "yarn.lock"},
+    {"node_modules", "pnpm-lock.yaml"},
+    {"node_modules", "bun.lock"},
+    {"node_modules", "bun.lockb"},
+    // go.mod pins versions on its own: minimal version selection is
+    // deterministic, so it is the lock file as well as the manifest.
+    {"vendor", "go.mod"},
+}};
+
 // Never matched and never descended into. Their contents are state managed
 // by another tool, where a name match is far likelier to be a false positive
 // than a cache, and a wrong deletion costs history, credentials, or a working
@@ -110,7 +137,386 @@ struct Target {
     fs::path path;
     std::uintmax_t size = 0;
     bool is_directory = false;
+    bool is_symlink = false;
+    std::string reason;
+    fs::file_time_type newest_time{};
+    bool has_time = false;
 };
+
+struct Config {
+    std::vector<std::string> patterns;
+    std::vector<std::string> excludes;
+    bool defaults = true;
+    bool build_artifacts = false;
+    bool dependencies = false;
+    bool skip_protected = true;
+    std::vector<std::pair<std::string, std::string>> dependency_markers;
+    std::vector<std::string> project_roots;
+    std::string older_than;
+    std::string larger_than;
+};
+
+static std::string trim(const std::string& value) {
+    const std::size_t first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) {
+        return {};
+    }
+    const std::size_t last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+static bool parse_bool(const std::string& value, bool& result) {
+    if (value == "true") {
+        result = true;
+        return true;
+    }
+    if (value == "false") {
+        result = false;
+        return true;
+    }
+    return false;
+}
+
+static bool parse_string_array(
+    const std::string& value,
+    std::vector<std::string>& result)
+{
+    const std::string text = trim(value);
+
+    if (text.size() < 2 || text.front() != '[' || text.back() != ']') {
+        return false;
+    }
+
+    const std::string body = text.substr(1, text.size() - 2);
+    std::size_t position = 0;
+
+    while (position < body.size()) {
+        while (position < body.size() &&
+               (body[position] == ' ' || body[position] == '\t' ||
+                body[position] == ',')) {
+            ++position;
+        }
+
+        if (position == body.size()) {
+            break;
+        }
+
+        if (body[position] != '"') {
+            return false;
+        }
+        ++position;
+
+        std::string item;
+        bool closed = false;
+        while (position < body.size()) {
+            const char c = body[position++];
+            if (c == '"') {
+                closed = true;
+                break;
+            }
+            if (c == '\\' || c == '\n' || c == '\r') {
+                return false;
+            }
+            item += c;
+        }
+
+        if (!closed) {
+            return false;
+        }
+
+        result.push_back(std::move(item));
+
+        while (position < body.size() &&
+               (body[position] == ' ' || body[position] == '\t')) {
+            ++position;
+        }
+        if (position < body.size() && body[position] != ',') {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// [["deps", "mix.exs"], ["vendor", "composer.lock"]]. The inner arrays go
+// through parse_string_array, so quoting and escaping stay defined in one
+// place; only the outer nesting is walked here.
+static bool parse_pair_array(
+    const std::string& value,
+    std::vector<std::pair<std::string, std::string>>& result)
+{
+    const std::string text = trim(value);
+
+    if (text.size() < 2 || text.front() != '[' || text.back() != ']') {
+        return false;
+    }
+
+    const std::string body = text.substr(1, text.size() - 2);
+    std::size_t position = 0;
+
+    while (position < body.size()) {
+        while (position < body.size() &&
+               (body[position] == ' ' || body[position] == '\t' ||
+                body[position] == ',')) {
+            ++position;
+        }
+
+        if (position == body.size()) {
+            break;
+        }
+
+        if (body[position] != '[') {
+            return false;
+        }
+
+        const std::size_t close = body.find(']', position);
+        if (close == std::string::npos) {
+            return false;
+        }
+
+        std::vector<std::string> pair;
+        if (!parse_string_array(body.substr(position, close - position + 1),
+                                pair) ||
+            pair.size() != 2) {
+            return false;
+        }
+
+        // The marker is looked up beside the directory, so it has to be a
+        // plain file name. A separator would reach outside that directory.
+        for (const std::string& part : pair) {
+            if (part.empty() || part == "." || part == ".." ||
+                part.find('/') != std::string::npos) {
+                return false;
+            }
+        }
+
+        result.emplace_back(pair[0], pair[1]);
+        position = close + 1;
+
+        while (position < body.size() &&
+               (body[position] == ' ' || body[position] == '\t')) {
+            ++position;
+        }
+        if (position < body.size() && body[position] != ',') {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool parse_string(const std::string& value, std::string& result) {
+    const std::string text = trim(value);
+    if (text.size() < 2 || text.front() != '"' || text.back() != '"') {
+        return false;
+    }
+    result = text.substr(1, text.size() - 2);
+    return result.find('\\') == std::string::npos &&
+           result.find('\n') == std::string::npos &&
+           result.find('\r') == std::string::npos;
+}
+
+static bool load_config(
+    const fs::path& path,
+    Config& config,
+    std::string& error)
+{
+    std::ifstream input(path);
+    if (!input) {
+        error = "Cannot read config file: " + path.string();
+        return false;
+    }
+
+    std::string line;
+    std::size_t line_number = 0;
+    while (std::getline(input, line)) {
+        ++line_number;
+        // Only a # outside quotes opens a comment. Truncating at the first one
+        // anywhere rejected patterns like "#*#", which name real files: emacs
+        // lock and autosave entries are the common case. Quotes toggle rather
+        // than nest, which is exact here because the string parsers below
+        // reject backslashes.
+        bool quoted = false;
+        for (std::size_t i = 0; i < line.size(); ++i) {
+            if (line[i] == '"') {
+                quoted = !quoted;
+            } else if (line[i] == '#' && !quoted) {
+                line.erase(i);
+                break;
+            }
+        }
+        line = trim(line);
+        if (line.empty()) {
+            continue;
+        }
+
+        const std::size_t equals = line.find('=');
+        if (equals == std::string::npos) {
+            error = path.string() + ":" + std::to_string(line_number) +
+                    ": expected key = value";
+            return false;
+        }
+
+        const std::string key = trim(line.substr(0, equals));
+        const std::string value = trim(line.substr(equals + 1));
+
+        if (key == "patterns") {
+            if (!parse_string_array(value, config.patterns)) {
+                error = path.string() + ":" + std::to_string(line_number) +
+                        ": patterns must be an array of strings";
+                return false;
+            }
+        } else if (key == "excludes") {
+            if (!parse_string_array(value, config.excludes)) {
+                error = path.string() + ":" + std::to_string(line_number) +
+                        ": excludes must be an array of strings";
+                return false;
+            }
+        } else if (key == "defaults") {
+            if (!parse_bool(value, config.defaults)) {
+                error = path.string() + ":" + std::to_string(line_number) +
+                        ": defaults must be true or false";
+                return false;
+            }
+        } else if (key == "build_artifacts") {
+            if (!parse_bool(value, config.build_artifacts)) {
+                error = path.string() + ":" + std::to_string(line_number) +
+                        ": build_artifacts must be true or false";
+                return false;
+            }
+        } else if (key == "dependencies") {
+            if (!parse_bool(value, config.dependencies)) {
+                error = path.string() + ":" + std::to_string(line_number) +
+                        ": dependencies must be true or false";
+                return false;
+            }
+        } else if (key == "skip_protected") {
+            if (!parse_bool(value, config.skip_protected)) {
+                error = path.string() + ":" + std::to_string(line_number) +
+                        ": skip_protected must be true or false";
+                return false;
+            }
+        } else if (key == "dependency_markers") {
+            if (!parse_pair_array(value, config.dependency_markers)) {
+                error = path.string() + ":" + std::to_string(line_number) +
+                        ": dependency_markers must be an array of "
+                        "[directory, marker] string pairs, each a plain name";
+                return false;
+            }
+        } else if (key == "project_roots") {
+            if (!parse_string_array(value, config.project_roots)) {
+                error = path.string() + ":" + std::to_string(line_number) +
+                        ": project_roots must be an array of strings";
+                return false;
+            }
+        } else if (key == "older_than") {
+            if (!parse_string(value, config.older_than)) {
+                error = path.string() + ":" + std::to_string(line_number) +
+                        ": older_than must be a quoted duration";
+                return false;
+            }
+        } else if (key == "larger_than") {
+            if (!parse_string(value, config.larger_than)) {
+                error = path.string() + ":" + std::to_string(line_number) +
+                        ": larger_than must be a quoted size";
+                return false;
+            }
+        } else {
+            error = path.string() + ":" + std::to_string(line_number) +
+                    ": unknown key " + key;
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static fs::path find_config(const fs::path& root) {
+    fs::path current = fs::absolute(root).lexically_normal();
+    if (!fs::is_directory(current)) {
+        current = current.parent_path();
+    }
+
+    while (!current.empty()) {
+        const fs::path candidate = current / ".cclean.toml";
+        std::error_code ec;
+        if (fs::is_regular_file(candidate, ec)) {
+            return candidate;
+        }
+        const fs::path parent = current.parent_path();
+        if (parent == current) {
+            break;
+        }
+        current = parent;
+    }
+
+    return {};
+}
+
+static std::optional<std::chrono::seconds> parse_duration(
+    const std::string& value)
+{
+    if (value.size() < 2) {
+        return std::nullopt;
+    }
+    const char suffix = value.back();
+    char* end = nullptr;
+    const double number = std::strtod(value.c_str(), &end);
+    // The suffix has to be the only thing left, or "1dd" and "1d5d" both read
+    // as one day: comparing *end to the last character alone cannot tell them
+    // from "1d".
+    const bool consumed = end == value.c_str() + value.size() - 1;
+    if (end != value.c_str() && consumed && number >= 0) {
+        double multiplier = 0;
+        switch (suffix) {
+        case 's': multiplier = 1; break;
+        case 'm': multiplier = 60; break;
+        case 'h': multiplier = 60 * 60; break;
+        case 'd': multiplier = 24 * 60 * 60; break;
+        case 'w': multiplier = 7 * 24 * 60 * 60; break;
+        default: return std::nullopt;
+        }
+        const double seconds = number * multiplier;
+        if (seconds <= static_cast<double>(std::numeric_limits<std::int64_t>::max())) {
+            return std::chrono::seconds(static_cast<std::int64_t>(seconds));
+        }
+    }
+    return std::nullopt;
+}
+
+static std::optional<std::uintmax_t> parse_size(const std::string& value) {
+    if (value.empty()) {
+        return std::nullopt;
+    }
+    std::size_t split = 0;
+    while (split < value.size() &&
+           ((value[split] >= '0' && value[split] <= '9') ||
+            value[split] == '.')) {
+        ++split;
+    }
+    if (split == 0) {
+        return std::nullopt;
+    }
+    const std::string number_text = value.substr(0, split);
+    char* end = nullptr;
+    const double number = std::strtod(number_text.c_str(), &end);
+    if (end == number_text.c_str() || *end != '\0') {
+        return std::nullopt;
+    }
+    const std::string suffix = value.substr(split);
+    double multiplier = 1;
+    if (suffix == "B" || suffix.empty()) multiplier = 1;
+    else if (suffix == "K" || suffix == "KiB") multiplier = 1024;
+    else if (suffix == "M" || suffix == "MiB") multiplier = 1024 * 1024;
+    else if (suffix == "G" || suffix == "GiB") multiplier = 1024 * 1024 * 1024;
+    else if (suffix == "T" || suffix == "TiB") multiplier = 1024.0 * 1024 * 1024 * 1024;
+    else return std::nullopt;
+    const double bytes = number * multiplier;
+    if (number < 0 || bytes > static_cast<double>(std::numeric_limits<std::uintmax_t>::max())) {
+        return std::nullopt;
+    }
+    return static_cast<std::uintmax_t>(bytes);
+}
 
 // A glob compiled to tokens. std::regex dominated the scan: on a 64k-entry
 // tree it cost 257 ms of a 414 ms run, because every entry is tested against
@@ -645,17 +1051,13 @@ static void size_directories(
         [&](const Job& job, std::vector<Job>& children) {
             std::uintmax_t total = 0;
             std::vector<std::string> local;
+            std::optional<fs::file_time_type> newest;
 
             std::error_code ec;
             fs::directory_iterator it(
                 job.directory,
-                fs::directory_options::skip_permission_denied,
+                fs::directory_options::none,
                 ec);
-
-            if (ec) {
-                local.push_back("Cannot scan " + job.directory.string() +
-                                ": " + ec.message());
-            }
 
             const fs::directory_iterator end;
 
@@ -686,6 +1088,17 @@ static void size_directories(
                     continue;
                 }
 
+                std::error_code time_ec;
+                const fs::file_time_type entry_time =
+                    entry.last_write_time(time_ec);
+                if (time_ec) {
+                    local.push_back("Cannot determine modification time of " +
+                                    entry.path().string() + ": " +
+                                    time_ec.message());
+                } else if (!newest || entry_time > *newest) {
+                    newest = entry_time;
+                }
+
                 // Not a symlink, so status() and symlink_status() agree here.
                 if (entry.is_directory(status_ec)) {
                     children.push_back({entry.path(), job.target});
@@ -695,10 +1108,19 @@ static void size_directories(
                 }
             }
 
+            if (ec) {
+                local.push_back("Error scanning " + job.directory.string() +
+                                ": " + ec.message());
+            }
+
             const std::lock_guard<std::mutex> guard(mutex);
 
             Target& target = targets[job.target];
             target.size = saturating_add(target.size, total);
+            if (newest && (!target.has_time || *newest > target.newest_time)) {
+                target.newest_time = *newest;
+                target.has_time = true;
+            }
 
             found.insert(found.end(),
                          std::make_move_iterator(local.begin()),
@@ -741,6 +1163,38 @@ static bool matches_any(
     return false;
 }
 
+static std::size_t matching_pattern(
+    const fs::path& path,
+    const fs::path& root,
+    const std::string& filename,
+    const std::vector<Glob>& patterns)
+{
+    std::string relative;
+    bool relative_built = false;
+
+    for (std::size_t i = 0; i < patterns.size(); ++i) {
+        const Glob& pattern = patterns[i];
+        if (pattern.matches(filename)) {
+            return i;
+        }
+
+        if (pattern.scope() == Glob::Scope::NameOnly) {
+            continue;
+        }
+
+        if (!relative_built) {
+            relative = path.lexically_relative(root).generic_string();
+            relative_built = true;
+        }
+
+        if (pattern.matches(relative)) {
+            return i;
+        }
+    }
+
+    return patterns.size();
+}
+
 static bool has_entry(const fs::path& directory, std::string_view name) {
     std::error_code ec;
     return fs::exists(directory / std::string(name), ec);
@@ -775,10 +1229,25 @@ static bool has_enclosing_project(fs::path project, const fs::path& root) {
     return false;
 }
 
+// lexically_normal() keeps a trailing separator when the path ends in a dot
+// component, so "/a/b/." becomes "/a/b/", which compares unequal to "/a/b".
+// A ROOT of "." reaches here as exactly that, so directory comparison needs
+// the separator gone.
+static fs::path normalize_directory(const fs::path& directory) {
+    const fs::path normalized = directory.lexically_normal();
+
+    if (normalized.filename().empty() && normalized.has_parent_path()) {
+        return normalized.parent_path();
+    }
+
+    return normalized;
+}
+
 static bool is_artifact_directory(
     const fs::path& directory,
     const std::string& name,
-    const fs::path& root)
+    const fs::path& root,
+    const std::vector<fs::path>& project_roots = {})
 {
     // Name first: it costs a few string compares, where the marker tests below
     // each cost a stat.
@@ -795,14 +1264,25 @@ static bool is_artifact_directory(
         return false;
     }
 
-    const fs::path project = directory.parent_path();
+    const fs::path project =
+        normalize_directory(fs::absolute(directory.parent_path()));
+    const fs::path normalized_root =
+        normalize_directory(fs::absolute(root));
 
-    if (!has_entry(project, ".git")) {
+    bool configured_project = false;
+    for (const fs::path& project_root : project_roots) {
+        if (project == project_root) {
+            configured_project = true;
+            break;
+        }
+    }
+
+    if (!configured_project && !has_entry(project, ".git")) {
         return false;
     }
 
     // The artifact must sit at the top level of the outermost project.
-    if (has_enclosing_project(project, root)) {
+    if (!configured_project && has_enclosing_project(project, normalized_root)) {
         return false;
     }
 
@@ -813,6 +1293,28 @@ static bool is_artifact_directory(
         }
     }
 
+    return false;
+}
+
+static bool is_dependency_directory(
+    const fs::path& directory,
+    const std::string& name,
+    const std::vector<std::pair<std::string, std::string>>& configured = {})
+{
+    for (const defaults::Artifact& dependency : defaults::dependencies) {
+        if (dependency.directory == name &&
+            has_entry(directory.parent_path(), dependency.marker)) {
+            return true;
+        }
+    }
+    // Configured pairs take the same marker guard and the same --dependencies
+    // gate as the built-ins, which is what separates them from a pattern.
+    for (const auto& dependency : configured) {
+        if (dependency.first == name &&
+            has_entry(directory.parent_path(), dependency.second)) {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -833,6 +1335,11 @@ static void scan_tree(
     const std::vector<Glob>& excludes,
     bool use_skips,
     bool build_artifacts,
+    bool dependencies,
+    const std::vector<std::pair<std::string, std::string>>& dependency_markers,
+    const std::vector<fs::path>& project_roots,
+    std::size_t builtin_count,
+    std::size_t config_count,
     std::vector<Target>& targets,
     std::vector<std::string>& errors,
     Progress& progress)
@@ -854,13 +1361,8 @@ static void scan_tree(
             std::error_code ec;
             fs::directory_iterator it(
                 directory,
-                fs::directory_options::skip_permission_denied,
+                fs::directory_options::none,
                 ec);
-
-            if (ec) {
-                local.push_back("Cannot scan " + directory.string() + ": " +
-                                ec.message());
-            }
 
             const fs::directory_iterator end;
 
@@ -905,9 +1407,14 @@ static void scan_tree(
                 const bool is_directory =
                     !is_symlink && entry.is_directory(status_ec);
 
-                if (!matches_any(path, root, filename, patterns) &&
-                    !(build_artifacts && is_directory &&
-                      is_artifact_directory(path, filename, root))) {
+                const std::size_t pattern_index =
+                    matching_pattern(path, root, filename, patterns);
+                const bool artifact = build_artifacts && is_directory &&
+                    is_artifact_directory(path, filename, root, project_roots);
+                const bool dependency = dependencies && is_directory &&
+                    is_dependency_directory(path, filename, dependency_markers);
+
+                if (pattern_index == patterns.size() && !artifact && !dependency) {
                     // Symlinks are never followed, so only a real directory
                     // is worth queueing.
                     if (is_directory) {
@@ -920,6 +1427,25 @@ static void scan_tree(
                 Target target;
                 target.path = path;
                 target.is_directory = is_directory;
+                target.is_symlink = is_symlink;
+                std::error_code time_ec;
+                target.newest_time = entry.last_write_time(time_ec);
+                target.has_time = !time_ec;
+                if (time_ec) {
+                    local.push_back("Cannot determine modification time of " +
+                                    path.string() + ": " + time_ec.message());
+                }
+                if (artifact) {
+                    target.reason = "build-artifact";
+                } else if (dependency) {
+                    target.reason = "dependency";
+                } else if (pattern_index < builtin_count) {
+                    target.reason = "default";
+                } else if (pattern_index < builtin_count + config_count) {
+                    target.reason = "config";
+                } else {
+                    target.reason = "command-line";
+                }
 
                 if (!is_directory && !is_symlink &&
                     entry.is_regular_file(status_ec)) {
@@ -932,6 +1458,11 @@ static void scan_tree(
                 }
 
                 local_targets.push_back(std::move(target));
+            }
+
+            if (ec) {
+                local.push_back("Error scanning " + directory.string() +
+                                ": " + ec.message());
             }
 
             const std::lock_guard<std::mutex> guard(mutex);
@@ -1007,6 +1538,128 @@ static std::string skipped_directories() {
     return list;
 }
 
+static std::string json_string(const std::string& value) {
+    std::string result = "\"";
+    for (const unsigned char c : value) {
+        switch (c) {
+        case '"': result += "\\\""; break;
+        case '\\': result += "\\\\"; break;
+        case '\n': result += "\\n"; break;
+        case '\r': result += "\\r"; break;
+        case '\t': result += "\\t"; break;
+        default:
+            if (c < 0x20) {
+                char escaped[7];
+                std::snprintf(escaped, sizeof(escaped), "\\u%04x", c);
+                result += escaped;
+            } else {
+                result += static_cast<char>(c);
+            }
+        }
+    }
+    result += '"';
+    return result;
+}
+
+static void print_json(
+    const fs::path& root,
+    const std::vector<Target>& targets,
+    const std::vector<std::string>& errors,
+    bool dry_run,
+    bool cancelled,
+    std::size_t removed,
+    std::size_t failed)
+{
+    std::uintmax_t total = 0;
+    std::map<std::string, std::pair<std::size_t, std::uintmax_t>> stats;
+
+    for (const Target& target : targets) {
+        total = saturating_add(total, target.size);
+        auto& stat = stats[target.reason];
+        ++stat.first;
+        stat.second = saturating_add(stat.second, target.size);
+    }
+
+    // Status reports the action, so a scan warning does not disguise a dry run
+    // as a failed removal. Warnings are their own array, and still set exit 1.
+    std::string status;
+    if (failed != 0) {
+        status = "failed";
+    } else if (targets.empty()) {
+        status = "empty";
+    } else if (cancelled) {
+        status = "cancelled";
+    } else if (dry_run) {
+        status = "dry-run";
+    } else {
+        status = "removed";
+    }
+
+    std::cout << "{\n"
+              << "  \"root\": " << json_string(root.string()) << ",\n"
+              << "  \"status\": " << json_string(status) << ",\n"
+              << "  \"targets\": [";
+
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+        const Target& target = targets[i];
+        if (i != 0) {
+            std::cout << ',';
+        }
+        std::cout << "\n    {\"path\": "
+                  << json_string(target.path.string())
+                  << ", \"type\": "
+                  << json_string(target.is_directory ? "directory" : "file")
+                  << ", \"bytes\": " << target.size
+                  << ", \"reason\": " << json_string(target.reason)
+                  << "}";
+    }
+
+    std::cout << "\n  ],\n"
+              << "  \"total\": {\"targets\": " << targets.size()
+              << ", \"bytes\": " << total << "},\n"
+              << "  \"stats\": {";
+
+    std::size_t stat_index = 0;
+    for (const auto& entry : stats) {
+        if (stat_index++ != 0) {
+            std::cout << ',';
+        }
+        std::cout << "\n    " << json_string(entry.first)
+                  << ": {\"targets\": " << entry.second.first
+                  << ", \"bytes\": " << entry.second.second << "}";
+    }
+
+    std::cout << "\n  },\n"
+              << "  \"removed\": " << removed << ",\n"
+              << "  \"failed\": " << failed << ",\n"
+              << "  \"warnings\": [";
+    for (std::size_t i = 0; i < errors.size(); ++i) {
+        if (i != 0) {
+            std::cout << ',';
+        }
+        std::cout << "\n    " << json_string(errors[i]);
+    }
+    std::cout << "\n  ]\n}\n";
+}
+
+static bool validate_target(const Target& target, std::string& error) {
+    std::error_code ec;
+    const fs::file_status status = fs::symlink_status(target.path, ec);
+    if (ec || status.type() == fs::file_type::not_found) {
+        error = "Target changed or disappeared: " + target.path.string();
+        return false;
+    }
+
+    const bool is_symlink = status.type() == fs::file_type::symlink;
+    const bool is_directory = status.type() == fs::file_type::directory;
+    if (is_symlink != target.is_symlink ||
+        (!target.is_symlink && is_directory != target.is_directory)) {
+        error = "Target changed type: " + target.path.string();
+        return false;
+    }
+    return true;
+}
+
 static void print_usage(const char* program) {
     std::cerr
         << "Usage:\n"
@@ -1018,10 +1671,20 @@ static void print_usage(const char* program) {
         << "  -b, --build-artifacts\n"
         << "                 Also remove a project's build output, listed\n"
         << "                 below\n"
+        << "      --dependencies\n"
+        << "                 Also remove marker-guarded dependency trees\n"
         << "  -e, --exclude PATTERN\n"
         << "                 Leave anything matching PATTERN alone, contents\n"
         << "                 included. Repeatable\n"
         << "  -v, --verbose  Name every item as it is removed\n"
+        << "  -y, --yes      Remove without prompting\n"
+        << "  --format FORMAT  Output human (default) or json\n"
+        << "  --older-than DURATION\n"
+        << "                 Match only targets older than DURATION\n"
+        << "                 (s, m, h, d, w)\n"
+        << "  --larger-than SIZE\n"
+        << "                 Match only targets of at least SIZE\n"
+        << "                 (B, K, M, G, T)\n"
         << "  -h, --help     Show this text\n"
         << "  -V, --version  Show the version and exit\n"
         << "  --no-defaults  Match only the patterns given on the command line\n"
@@ -1052,6 +1715,18 @@ int main(int argc, char* argv[]) {
     bool use_skips = true;
     bool verbose = false;
     bool build_artifacts = false;
+    bool dependencies = false;
+    bool assume_yes = false;
+    bool format_json = false;
+    bool cli_defaults = false;
+    bool cli_build_artifacts = false;
+    bool cli_dependencies = false;
+    bool cli_skip = false;
+    bool cli_excludes = false;
+    bool cli_older_than = false;
+    bool cli_larger_than = false;
+    std::string older_than;
+    std::string larger_than;
     std::vector<std::string> exclude_patterns;
     bool options_ended = false;
     std::vector<std::string> operands;
@@ -1074,21 +1749,90 @@ int main(int argc, char* argv[]) {
 
             if (argument == "--no-defaults") {
                 use_defaults = false;
+                cli_defaults = true;
                 continue;
             }
 
             if (argument == "--no-skip") {
                 use_skips = false;
+                cli_skip = true;
                 continue;
             }
 
             if (argument == "-b" || argument == "--build-artifacts") {
                 build_artifacts = true;
+                cli_build_artifacts = true;
+                continue;
+            }
+
+            if (argument == "--dependencies") {
+                dependencies = true;
+                cli_dependencies = true;
                 continue;
             }
 
             if (argument == "-v" || argument == "--verbose") {
                 verbose = true;
+                continue;
+            }
+
+            if (argument == "-y" || argument == "--yes") {
+                assume_yes = true;
+                continue;
+            }
+
+            if (argument == "--older-than" || argument == "--larger-than") {
+                if (i + 1 >= argc) {
+                    std::cerr << argument << " needs a value.\n";
+                    return 2;
+                }
+                std::string& destination = argument == "--older-than"
+                    ? older_than : larger_than;
+                destination = argv[++i];
+                if (argument == "--older-than") cli_older_than = true;
+                else cli_larger_than = true;
+                continue;
+            }
+
+            if (argument.rfind("--older-than=", 0) == 0) {
+                older_than = argument.substr(13);
+                cli_older_than = true;
+                continue;
+            }
+
+            if (argument.rfind("--larger-than=", 0) == 0) {
+                larger_than = argument.substr(14);
+                cli_larger_than = true;
+                continue;
+            }
+
+            if (argument == "--format") {
+                if (i + 1 >= argc) {
+                    std::cerr << argument << " needs a format.\n";
+                    return 2;
+                }
+                const std::string value = argv[++i];
+                if (value == "json") {
+                    format_json = true;
+                } else if (value == "human") {
+                    format_json = false;
+                } else {
+                    std::cerr << "Unknown format: " << value << '\n';
+                    return 2;
+                }
+                continue;
+            }
+
+            if (argument.rfind("--format=", 0) == 0) {
+                const std::string value = argument.substr(9);
+                if (value == "json") {
+                    format_json = true;
+                } else if (value == "human") {
+                    format_json = false;
+                } else {
+                    std::cerr << "Unknown format: " << value << '\n';
+                    return 2;
+                }
                 continue;
             }
 
@@ -1105,11 +1849,13 @@ int main(int argc, char* argv[]) {
 
                 // Taken verbatim, so a pattern may itself begin with a dash.
                 exclude_patterns.push_back(argv[++i]);
+                cli_excludes = true;
                 continue;
             }
 
             if (argument.rfind("--exclude=", 0) == 0) {
                 exclude_patterns.push_back(argument.substr(10));
+                cli_excludes = true;
                 continue;
             }
 
@@ -1131,19 +1877,117 @@ int main(int argc, char* argv[]) {
         operands.push_back(".");
     }
 
-    // --build-artifacts matches on project layout rather than on a pattern,
-    // so it is on its own enough to give the run something to do.
-    if (!use_defaults && operands.size() == 1 && !build_artifacts) {
-        std::cerr << "--no-defaults leaves no patterns to match; "
-                     "supply at least one, or --build-artifacts.\n";
+    const fs::path root = fs::path(operands.front());
+
+    Config config;
+    const fs::path config_path = find_config(root);
+    if (!config_path.empty()) {
+        std::string config_error;
+        if (!load_config(config_path, config, config_error)) {
+            std::cerr << config_error << '\n';
+            return 2;
+        }
+    }
+
+    if (!cli_defaults) {
+        use_defaults = config.defaults;
+    }
+    if (!cli_build_artifacts) {
+        build_artifacts = config.build_artifacts;
+    }
+    if (!cli_dependencies) {
+        dependencies = config.dependencies;
+    }
+    if (!cli_skip) {
+        use_skips = config.skip_protected;
+    }
+    if (!cli_excludes) {
+        exclude_patterns = config.excludes;
+    }
+    if (!cli_older_than) older_than = config.older_than;
+    if (!cli_larger_than) larger_than = config.larger_than;
+
+    const fs::path absolute_root = normalize_directory(fs::absolute(root));
+
+    // Anchored to the config file, not to ROOT. The config is found by
+    // searching upward, so a repository-level .cclean.toml is read for every
+    // ROOT beneath it; resolving its entries against ROOT instead made
+    // project_roots = ["packages/api"] fail with "not a directory" on any run
+    // from a subdirectory, including runs that never look at build artifacts.
+    // An entry naming a sibling of ROOT is not an error, it simply never
+    // matches, because the walk stays under ROOT.
+    const fs::path config_dir = config_path.empty()
+        ? absolute_root
+        : normalize_directory(fs::absolute(config_path).parent_path());
+
+    std::vector<fs::path> project_roots;
+    for (const std::string& configured : config.project_roots) {
+        const fs::path relative = fs::path(configured);
+        if (relative.is_absolute()) {
+            std::cerr << "project_roots entries must be relative to "
+                         ".cclean.toml: " << configured << '\n';
+            return 2;
+        }
+        const fs::path candidate =
+            normalize_directory(config_dir / relative);
+        const std::string candidate_relative =
+            candidate.lexically_relative(config_dir).generic_string();
+        if (candidate_relative == ".." ||
+            candidate_relative.rfind("../", 0) == 0) {
+            std::cerr << "project_roots entry is outside .cclean.toml's "
+                         "directory: " << configured << '\n';
+            return 2;
+        }
+        std::error_code project_ec;
+        if (!fs::is_directory(candidate, project_ec) || project_ec) {
+            std::cerr << "project_roots entry is not a directory: "
+                      << configured << '\n';
+            return 2;
+        }
+        project_roots.push_back(candidate);
+    }
+
+    std::optional<std::chrono::seconds> older_limit;
+    if (!older_than.empty()) {
+        older_limit = parse_duration(older_than);
+        if (!older_limit) {
+            std::cerr << "Invalid --older-than duration: " << older_than
+                      << " (use a number followed by s, m, h, d, or w)\n";
+            return 2;
+        }
+    }
+
+    std::optional<std::uintmax_t> larger_limit;
+    if (!larger_than.empty()) {
+        larger_limit = parse_size(larger_than);
+        if (!larger_limit) {
+            std::cerr << "Invalid --larger-than size: " << larger_than
+                      << " (use B, K, M, G, or T)\n";
+            return 2;
+        }
+    }
+
+    // --build-artifacts and --dependencies match on project layout rather than
+    // on a pattern, so either is on its own enough to give the run something
+    // to do.
+    if (!use_defaults && operands.size() == 1 && config.patterns.empty() &&
+        !build_artifacts && !dependencies) {
+        // The defaults can be switched off by the config rather than by the
+        // flag, so naming --no-defaults would point at an argument the user
+        // never typed.
+        std::cerr << (cli_defaults ? "--no-defaults" : "defaults = false")
+                  << " leaves no patterns to match; supply at least one, or "
+                     "--build-artifacts, or --dependencies.\n";
         return 2;
     }
 
-    const fs::path root = fs::path(operands.front());
-
     std::vector<Glob> patterns;
     patterns.reserve(
-        (use_defaults ? defaults::patterns.size() : 0) + operands.size() - 1);
+        (use_defaults ? defaults::patterns.size() : 0) + config.patterns.size() +
+        operands.size() - 1);
+
+    const std::size_t builtin_count =
+        use_defaults ? defaults::patterns.size() : 0;
 
     // The built-ins all name a file or directory, so matching them against the
     // relative path only ever adds false positives: ".*_cache" would otherwise
@@ -1155,6 +1999,12 @@ int main(int argc, char* argv[]) {
                                   Glob::Scope::NameOnly);
         }
     }
+
+    for (const std::string& pattern : config.patterns) {
+        patterns.emplace_back(pattern, Glob::Scope::NameOrPath);
+    }
+
+    const std::size_t config_count = config.patterns.size();
 
     // Additional patterns supplied by the user.
     for (std::size_t i = 1; i < operands.size(); ++i) {
@@ -1190,7 +2040,7 @@ int main(int argc, char* argv[]) {
     // than a warning raised by whichever worker happened to draw it.
     {
         fs::directory_iterator probe(
-            root, fs::directory_options::skip_permission_denied, ec);
+            root, fs::directory_options::none, ec);
 
         if (ec) {
             std::cerr << "Cannot scan root path: "
@@ -1202,10 +2052,39 @@ int main(int argc, char* argv[]) {
     Progress progress(is_terminal(STDERR_FILENO));
 
     scan_tree(root, patterns, excludes, use_skips, build_artifacts,
+              dependencies, config.dependency_markers, project_roots,
+              builtin_count, config_count,
               targets, errors, progress);
 
     size_directories(targets, errors, progress);
     progress.finish();
+
+    if (older_limit || larger_limit) {
+        const fs::file_time_type now = fs::file_time_type::clock::now();
+        std::vector<Target> filtered;
+        filtered.reserve(targets.size());
+
+        for (Target& target : targets) {
+            bool keep = true;
+            if (older_limit) {
+                if (!target.has_time) {
+                    errors.push_back("Cannot apply age filter to " +
+                                     target.path.string());
+                    keep = false;
+                } else if (target.newest_time >
+                           now - *older_limit) {
+                    keep = false;
+                }
+            }
+            if (keep && larger_limit && target.size < *larger_limit) {
+                keep = false;
+            }
+            if (keep) {
+                filtered.push_back(std::move(target));
+            }
+        }
+        targets.swap(filtered);
+    }
 
     const Style out = Style::detect(STDOUT_FILENO);
     const Style err = Style::detect(STDERR_FILENO);
@@ -1218,8 +2097,12 @@ int main(int argc, char* argv[]) {
     }
 
     if (targets.empty()) {
-        std::cout << "No matching targets found.\n";
-        return 0;
+        if (format_json) {
+            print_json(root, targets, errors, dry_run, false, 0, 0);
+        } else {
+            std::cout << "No matching targets found.\n";
+        }
+        return errors.empty() ? 0 : 1;
     }
 
     // Directory iteration order is unspecified; the user reviews this list
@@ -1231,45 +2114,68 @@ int main(int argc, char* argv[]) {
 
     std::uintmax_t total_size = 0;
 
-    std::cout << "\nMatched targets:\n";
-
     for (const auto& target : targets) {
         total_size = saturating_add(total_size, target.size);
+    }
 
-        if (target.is_directory) {
-            std::cout << "  " << out.directory << target.path.string() << '/'
-                      << out.reset;
-        } else {
-            std::cout << "  " << target.path.string();
+    if (!format_json) {
+        std::cout << "\nMatched targets:\n";
+
+        for (const auto& target : targets) {
+            if (target.is_directory) {
+                std::cout << "  " << out.directory << target.path.string() << '/'
+                          << out.reset;
+            } else {
+                std::cout << "  " << target.path.string();
+            }
+
+            std::cout << out.dim << "  " << format_size(target.size) << out.reset
+                      << '\n';
         }
 
-        std::cout << out.dim << "  " << format_size(target.size) << out.reset
-                  << '\n';
+        std::cout << '\n'
+                  << out.bold << targets.size() << out.reset
+                  << (targets.size() == 1 ? " target, " : " targets, ")
+                  << out.bold << format_size(total_size) << out.reset
+                  << " to reclaim\n";
     }
-
-    std::cout << '\n'
-              << out.bold << targets.size() << out.reset
-              << (targets.size() == 1 ? " target, " : " targets, ")
-              << out.bold << format_size(total_size) << out.reset
-              << " to reclaim\n";
 
     if (dry_run) {
-        std::cout << out.dim << "Dry run: nothing was removed."
-                  << out.reset << '\n';
-        return 0;
+        if (format_json) {
+            print_json(root, targets, errors, true, false, 0, 0);
+        } else {
+            std::cout << out.dim << "Dry run: nothing was removed."
+                      << out.reset << '\n';
+        }
+        return errors.empty() ? 0 : 1;
     }
 
-    std::cout << "\nPermanently remove? "
-              << out.bold << "[y/N]" << out.reset << ' ';
-    std::cout.flush();
-
-    const bool go_ahead = confirmed();
-
-    std::cout << (go_ahead ? "y" : "n") << '\n';
+    bool go_ahead = assume_yes;
+    if (!assume_yes) {
+        if (format_json) {
+            std::cerr << "Permanently remove " << targets.size()
+                      << " targets? [y/N] ";
+            std::cerr.flush();
+        } else {
+            std::cout << "\nPermanently remove? "
+                      << out.bold << "[y/N]" << out.reset << ' ';
+            std::cout.flush();
+        }
+        go_ahead = confirmed();
+        if (format_json) {
+            std::cerr << (go_ahead ? "y" : "n") << '\n';
+        } else {
+            std::cout << (go_ahead ? "y" : "n") << '\n';
+        }
+    }
 
     if (!go_ahead) {
-        std::cout << "Cancelled.\n";
-        return 0;
+        if (format_json) {
+            print_json(root, targets, errors, false, true, 0, 0);
+        } else {
+            std::cout << "Cancelled.\n";
+        }
+        return errors.empty() ? 0 : 1;
     }
 
     std::size_t removed = 0;
@@ -1278,6 +2184,17 @@ int main(int argc, char* argv[]) {
     // The matched list was already shown, so only failures are named again.
     // --verbose restores the per-item log.
     for (const auto& target : targets) {
+        std::string validation_error;
+        if (!validate_target(target, validation_error)) {
+            ++failed;
+            errors.push_back(validation_error);
+            if (!format_json) {
+                std::cerr << "  " << err.failure << "failed" << err.reset << "  "
+                          << validation_error << '\n';
+            }
+            continue;
+        }
+
         std::error_code remove_ec;
 
         if (target.is_directory) {
@@ -1294,7 +2211,7 @@ int main(int argc, char* argv[]) {
         } else {
             ++removed;
 
-            if (verbose) {
+            if (verbose && !format_json) {
                 std::cout << "  " << out.dim << "removed" << out.reset << "  "
                           << target.path.string() << '\n';
             }
@@ -1302,14 +2219,21 @@ int main(int argc, char* argv[]) {
     }
 
     if (failed == 0) {
-        std::cout << out.success << "Removed " << removed << out.reset
-                  << ", " << format_size(total_size) << " reclaimed\n";
-        return 0;
+        if (format_json) {
+            print_json(root, targets, errors, false, false, removed, failed);
+        } else {
+            std::cout << out.success << "Removed " << removed << out.reset
+                      << ", " << format_size(total_size) << " reclaimed\n";
+        }
+        return errors.empty() ? 0 : 1;
     }
 
-    std::cout << "Removed " << removed << ", "
-              << out.failure << failed << " failed" << out.reset << '\n';
+    if (format_json) {
+        print_json(root, targets, errors, false, false, removed, failed);
+    } else {
+        std::cout << "Removed " << removed << ", "
+                  << out.failure << failed << " failed" << out.reset << '\n';
+    }
 
     return 1;
 }
-

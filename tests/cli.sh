@@ -137,6 +137,256 @@ d=$(fixture verbose_on)
 loud_lines=$(printf 'y' | "$CCLEAN" --verbose "$d" | grep -c 'removed ')
 check "verbose lists each removal" 3 "$loud_lines"
 
+# ----------------------------------------------------------- configuration
+
+d=$WORK/config
+rm -rf "$d"
+mkdir -p "$d/sub"
+printf 'x' > "$d/remove.tmp"
+printf 'x' > "$d/keep.pyc"
+printf 'x' > "$d/sub/cache.pyc"
+printf 'patterns = [\"*.tmp\"]\n' > "$d/.cclean.toml"
+printf 'excludes = [\"keep.pyc\"]\n' >> "$d/.cclean.toml"
+printf 'defaults = true\n' >> "$d/.cclean.toml"
+
+check "config adds patterns and defaults" "2 targets, 2 B to reclaim" \
+      "$($CCLEAN -n "$d" | grep 'to reclaim')"
+check "config pattern is reported" 1 "$($CCLEAN -n "$d" | grep -c 'remove.tmp')"
+check "config exclude is applied" 0 "$($CCLEAN -n "$d" | grep -c 'keep.pyc')"
+check "CLI defaults override config" 0 \
+      "$($CCLEAN -n --no-defaults "$d" | grep -c 'cache.pyc')"
+
+printf 'unknown_key = true\n' > "$d/.cclean.toml"
+"$CCLEAN" -n "$d" >/dev/null 2>&1
+check "unknown config key exits 2" 2 $?
+
+# A # opens a comment only outside quotes; emacs lock and autosave files are
+# named with it.
+printf 'x' > "$d/#locked#"
+printf 'patterns = [\"#*#\"]  # trailing comment\n' > "$d/.cclean.toml"
+printf 'defaults = false\n' >> "$d/.cclean.toml"
+check "quoted # is not a comment" 1 "$($CCLEAN -n "$d" | grep -c 'locked')"
+
+d=$WORK/monorepo
+rm -rf "$d"
+mkdir -p "$d/packages/app/build"
+printf 'x' > "$d/packages/app/CMakeLists.txt"
+printf 'xx' > "$d/packages/app/build/out"
+mkdir -p "$d/packages/other"
+printf 'project_roots = [\"packages/app\", \"packages/other\"]\n' > "$d/.cclean.toml"
+check "configured monorepo project is detected" \
+      "1 target, 2 B to reclaim" "$(cd "$d" && "$CCLEAN" -n -b . | grep 'to reclaim')"
+
+# project_roots resolve against the directory holding .cclean.toml, not ROOT.
+# Resolving against ROOT made every run from a subdirectory fail, including
+# runs that never consult build artifacts.
+check "project_roots work from a subdirectory" \
+      "1 target, 2 B to reclaim" \
+      "$(cd "$d/packages/app" && "$CCLEAN" -n -b . | grep 'to reclaim')"
+(cd "$d/packages/app" && "$CCLEAN" -n . >/dev/null 2>&1)
+check "config from a parent does not break a plain run" 0 $?
+(cd "$d" && "$CCLEAN" -n -b packages/app >/dev/null 2>&1)
+check "project_roots survive a ROOT below the config" 0 $?
+
+printf 'project_roots = [\"../escape\"]\n' > "$d/.cclean.toml"
+"$CCLEAN" -n "$d" >/dev/null 2>&1
+check "project_roots escaping the config directory exits 2" 2 $?
+rm -f "$d/.cclean.toml"
+
+d=$WORK/dependencies
+rm -rf "$d"
+mkdir -p "$d/node_modules/pkg" "$d/vendor" "$d/random/node_modules"
+printf 'x' > "$d/package.json"
+printf 'x' > "$d/package-lock.json"
+printf 'xx' > "$d/node_modules/pkg/file"
+printf 'x' > "$d/vendor/file"
+printf 'x' > "$d/random/node_modules/file"
+check "dependencies are excluded by default" 0 \
+      "$($CCLEAN -n "$d" | grep -c 'node_modules')"
+check "marker-guarded dependencies are detected" 1 \
+      "$($CCLEAN -n --dependencies "$d" | grep -c 'node_modules/')"
+check "unmarked dependency trees are ignored" 0 \
+      "$($CCLEAN -n --dependencies "$d" | grep -c 'random/node_modules')"
+
+# package.json carries ranges; only package-lock.json pins the tree that
+# `npm ci` reinstalls.
+rm -f "$d/package-lock.json"
+check "node_modules needs the lock, not the manifest" 0 \
+      "$($CCLEAN -n --dependencies "$d" | grep -c 'node_modules/')"
+printf 'x' > "$d/package-lock.json"
+check "the lock file qualifies node_modules" 1 \
+      "$($CCLEAN -n --dependencies "$d" | grep -c 'node_modules/')"
+
+# Every package manager installs into node_modules but writes its own lock,
+# so each name needs its own row.
+for lock in package-lock.json npm-shrinkwrap.json yarn.lock \
+            pnpm-lock.yaml bun.lock bun.lockb; do
+    rm -f "$d"/package-lock.json "$d"/npm-shrinkwrap.json "$d"/yarn.lock \
+          "$d"/pnpm-lock.yaml "$d"/bun.lock "$d"/bun.lockb
+    printf 'x' > "$d/$lock"
+    check "$lock qualifies node_modules" 1 \
+          "$($CCLEAN -n --dependencies "$d" | grep -c 'node_modules/')"
+done
+
+# The list is the six npm-compatible lock names. deno.lock also sits beside a
+# node_modules, and is left for dependency_markers.
+rm -f "$d"/bun.lockb
+printf 'x' > "$d/deno.lock"
+check "an unlisted lock name is left alone" 0 \
+      "$($CCLEAN -n --dependencies "$d" | grep -c 'node_modules/')"
+rm -f "$d/deno.lock"
+printf 'x' > "$d/package-lock.json"
+
+# --dependencies matches on layout, so like --build-artifacts it is by itself
+# enough to give a --no-defaults run something to do.
+check "--no-defaults --dependencies still matches" 1 \
+      "$($CCLEAN -n --no-defaults --dependencies "$d" | grep -c 'node_modules/')"
+"$CCLEAN" -n --no-defaults --dependencies "$d" >/dev/null 2>&1
+check "--no-defaults --dependencies exits 0" 0 $?
+
+# A .venv is a dependency tree only when uv.lock is beside it: that is what
+# `uv sync` restores from. A pyproject.toml alone is also produced by poetry,
+# pdm and hatch, and by `uv venv` with no lock, none of which rebuild a known
+# environment.
+d=$WORK/venv_deps
+rm -rf "$d"
+mkdir -p "$d/uvlocked/.venv/lib" "$d/nolock/.venv/lib" "$d/bare/venv/lib"
+printf 'x' > "$d/uvlocked/pyproject.toml"
+printf 'x' > "$d/uvlocked/uv.lock"
+printf 'xx' > "$d/uvlocked/.venv/lib/f"
+printf 'x' > "$d/nolock/pyproject.toml"
+printf 'xx' > "$d/nolock/.venv/lib/f"
+printf 'x' > "$d/bare/uv.lock"
+printf 'xx' > "$d/bare/venv/lib/f"
+
+check "uv-locked .venv is a dependency target" 1 \
+      "$($CCLEAN -n --dependencies --no-defaults "$d" | grep -c 'uvlocked/.venv/')"
+check "unlocked .venv is left alone" 0 \
+      "$($CCLEAN -n --dependencies --no-defaults "$d" | grep -c 'nolock/.venv')"
+check "a venv without the dot is left alone" 0 \
+      "$($CCLEAN -n --dependencies --no-defaults "$d" | grep -c 'bare/venv')"
+check "no .venv is touched without --dependencies" 0 \
+      "$($CCLEAN -n "$d" | grep -c '.venv/$')"
+
+# vendor/ is a generic name, so go.mod is what qualifies it. The list covers
+# three ecosystems deliberately; a vendor/ belonging to anything else is left
+# for a pattern in .cclean.toml.
+d=$WORK/vendor_deps
+rm -rf "$d"
+mkdir -p "$d/golang/vendor" "$d/other/vendor"
+printf 'x' > "$d/golang/go.mod"
+printf 'xx' > "$d/golang/vendor/f"
+printf 'x' > "$d/other/composer.lock"
+printf 'xx' > "$d/other/vendor/f"
+
+check "go vendor needs only go.mod" 1 \
+      "$($CCLEAN -n --dependencies --no-defaults "$d" | grep -c 'golang/vendor/')"
+check "an unlisted ecosystem's vendor is left alone" 0 \
+      "$($CCLEAN -n --dependencies --no-defaults "$d" | grep -c 'other/vendor')"
+
+# dependency_markers adds ecosystems the built-in list leaves out. A configured
+# pair takes the same marker guard and the same --dependencies gate as a
+# built-in, which is what separates it from a plain pattern.
+d=$WORK/config_deps
+rm -rf "$d"
+mkdir -p "$d/app/deps/pkg" "$d/plain/deps" "$d/skipme/deps"
+printf 'x' > "$d/app/mix.exs"
+printf 'xx' > "$d/app/deps/pkg/f"
+printf 'xx' > "$d/plain/deps/f"
+printf 'x' > "$d/skipme/mix.exs"
+printf 'xx' > "$d/skipme/deps/f"
+printf 'dependencies = true\n' > "$d/.cclean.toml"
+printf 'dependency_markers = [[\"deps\", \"mix.exs\"]]\n' >> "$d/.cclean.toml"
+
+check "configured dependency pair is matched" 1 \
+      "$($CCLEAN -n --no-defaults "$d" | grep -c 'app/deps/')"
+check "configured pair still needs its marker" 0 \
+      "$($CCLEAN -n --no-defaults "$d" | grep -c 'plain/deps')"
+check "configured pair honours excludes" 0 \
+      "$($CCLEAN -n --no-defaults --exclude skipme "$d" | grep -c 'skipme/deps')"
+
+# The gate is the flag, not the key: turning dependencies off in the config
+# leaves the configured pairs inert.
+printf 'dependencies = false\n' > "$d/.cclean.toml"
+printf 'dependency_markers = [[\"deps\", \"mix.exs\"]]\n' >> "$d/.cclean.toml"
+check "configured pairs are gated by --dependencies" 0 \
+      "$($CCLEAN -n "$d" | grep -c 'app/deps/')"
+check "the flag re-enables configured pairs" 1 \
+      "$($CCLEAN -n --dependencies "$d" | grep -c 'app/deps/')"
+
+# A marker is looked up beside the directory, so it has to be a plain name.
+for bad in 'dependency_markers = [\"deps\"]' \
+           'dependency_markers = [[\"deps\"]]' \
+           'dependency_markers = [[\"deps\", \"a\", \"b\"]]' \
+           'dependency_markers = [[\"deps\", \"../mix.exs\"]]' \
+           'dependency_markers = [[\"\", \"mix.exs\"]]'; do
+    printf '%b\n' "$bad" > "$d/.cclean.toml"
+    "$CCLEAN" -n "$d" >/dev/null 2>&1
+    check "malformed dependency_markers exits 2: $bad" 2 $?
+done
+
+
+# Filters operate on matched files and use the directory's newest entry when
+# the target is a directory.
+d=$WORK/filters
+rm -rf "$d"
+mkdir -p "$d/cache"
+printf 'x' > "$d/old.pyc"
+printf '1234567890' > "$d/large.pyc"
+touch -t 202001010000 "$d/old.pyc"
+check "age filter keeps targets older than the duration" 1 \
+      "$($CCLEAN -n --older-than 1d "$d" | grep -c 'old.pyc')"
+check "age filter drops targets younger than the duration" 0 \
+      "$($CCLEAN -n --older-than 1d "$d" | grep -c 'large.pyc')"
+check "size filter selects large targets" 1 \
+      "$($CCLEAN -n --larger-than 5B "$d" | grep -c 'large.pyc')"
+check "size filter drops small targets" 0 \
+      "$($CCLEAN -n --larger-than 5B "$d" | grep -c 'old.pyc')"
+"$CCLEAN" -n --older-than nonsense "$d" >/dev/null 2>&1
+check "invalid age filter exits 2" 2 $?
+"$CCLEAN" -n --larger-than nonsense "$d" >/dev/null 2>&1
+check "invalid size filter exits 2" 2 $?
+
+# A suffix that is merely the last character let "1dd" and "1d5d" read as one
+# day.
+for bad in 1dd 1d5d 1d1; do
+    "$CCLEAN" -n --older-than "$bad" "$d" >/dev/null 2>&1
+    check "trailing garbage in --older-than $bad exits 2" 2 $?
+done
+
+# --------------------------------------------------------------- JSON output
+
+d=$(fixture json)
+json=$WORK/result.json
+"$CCLEAN" -n --format json "$d" >"$json" 2>"$WORK/json.err"
+check "JSON dry run exits 0" 0 $?
+check "JSON has no human header" 0 "$(grep -c 'Matched targets' "$json")"
+check "JSON has default reasons" 3 "$(grep -c '\"reason\": \"default\"' "$json")"
+check "JSON has statistics" 1 "$(grep -c '\"stats\"' "$json")"
+check "JSON keeps diagnostics off stdout" 0 "$(grep -c 'Warnings' "$json")"
+
+d=$(fixture json_remove)
+"$CCLEAN" --yes --format=json "$d" >"$json" 2>"$WORK/json_remove.err"
+check "--yes JSON exits 0" 0 $?
+check "--yes removes targets" 2 "$(count_files "$d")"
+check "--yes does not prompt" 0 "$(grep -c 'Permanently remove' "$json")"
+check "JSON reports removal" 1 "$(grep -c '\"status\": \"removed\"' "$json")"
+
+# A scan warning sets exit 1 but must not relabel a dry run as a failed
+# removal: status reports the action, warnings are their own array.
+d=$WORK/json_warn
+rm -rf "$d"
+mkdir -p "$d/locked" "$d/ok"
+printf 'x' > "$d/ok/a.pyc"
+chmod 000 "$d/locked"
+"$CCLEAN" -n --format json "$d" >"$json" 2>/dev/null
+check "scan warning exits 1" 1 $?
+check "warning keeps the dry-run status" 1 \
+      "$(grep -c '\"status\": \"dry-run\"' "$json")"
+check "warning is reported in the JSON" 1 \
+      "$(grep -c 'Permission denied' "$json")"
+chmod 755 "$d/locked"
+
 # ------------------------------------------------------------- exit codes
 
 "$CCLEAN" --help >/dev/null 2>&1

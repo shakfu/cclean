@@ -88,13 +88,60 @@ cclean --no-defaults . "build/**"         # only what is named here
 |-|-|
 | `-n`, `--dry-run` | List matches and exit without removing |
 | `-b`, `--build-artifacts` | Also remove project build output (see below) |
+| `--dependencies` | Also remove marker-guarded dependency trees |
 | `-e`, `--exclude PATTERN` | Leave anything matching alone, contents included. Repeatable |
 | `-v`, `--verbose` | Name every item as it is removed |
+| `-y`, `--yes` | Remove without prompting |
+| `--format FORMAT` | Select `human` (default) or `json` output |
+| `--older-than DURATION` | Match only targets older than a duration (`s`, `m`, `h`, `d`, `w`) |
+| `--larger-than SIZE` | Match only targets of at least a size (`B`, `K`, `M`, `G`, `T`) |
 | `-h`, `--help` | Show usage |
 | `-V`, `--version` | Show the version and exit |
 | `--no-defaults` | Match only the patterns given on the command line |
 | `--no-skip` | Descend into the protected directories listed below |
 | `--` | Treat every later argument as `ROOT` or a pattern |
+
+### Configuration
+
+cclean searches from `ROOT` upward for the first `.cclean.toml`. It does not
+read configuration from outside that ancestor chain. CLI options override
+configuration values. CLI exclude patterns replace configured excludes when at
+least one `--exclude` is supplied; command-line patterns are added after
+configured patterns.
+
+The supported schema is deliberately small and rejects unknown keys or invalid
+values:
+
+```toml
+patterns = ["*.tmp", "**/generated/**"]
+excludes = ["fixtures", ".venv"]
+defaults = true
+build_artifacts = false
+dependencies = false
+skip_protected = true
+dependency_markers = [["deps", "mix.exs"], ["vendor", "composer.lock"]]
+project_roots = ["packages/api", "packages/worker"]
+older_than = "30d"
+larger_than = "100M"
+```
+
+`patterns`, `excludes`, and `project_roots` are arrays of strings;
+`dependency_markers` is an array of two-string arrays. The other values are
+booleans or quoted filter values. Configuration errors exit with status 2
+before scanning starts.
+
+`dependency_markers` adds ecosystems the built-in list leaves out. Each entry
+is a directory name and the marker file that must sit beside it, both plain
+names rather than paths, since the marker is looked up in the directory's
+parent. A configured pair takes the same marker guard and the same
+`--dependencies` gate as a built-in, which is what distinguishes it from a
+pattern: `patterns = ["deps"]` matches any directory of that name, on every
+run.
+
+Project roots let marker files identify package projects inside a monorepo.
+They are relative to the directory holding `.cclean.toml`, not to `ROOT`, so
+one repository-level file serves every `ROOT` beneath it; an entry outside the
+`ROOT` of a given run simply never matches.
 
 ## What it removes by default
 
@@ -137,9 +184,56 @@ A marker only licenses the directory it is paired with: `package.json` beside a 
 
 The directory must also be top-level in the outermost project. A submodule or a vendored checkout carries its own `.git` and marker file, so its `build/` would otherwise qualify on its own; if anything between it and `ROOT` is a repository, it is skipped. Name the nested project as `ROOT` to clean it directly.
 
-`node_modules/` is deliberately absent. It is dependencies rather than build output, and restoring it needs the network, where everything above rebuilds offline. Remove it with a pattern if you want to: `cclean . node_modules`. A separate `--dependencies` flag is in `TODO.md`.
+`node_modules/` is deliberately absent. It is dependencies rather than build output, and restoring it needs the network, where everything above rebuilds offline. Remove it with a pattern if you want to: `cclean . node_modules`.
 
-The `.git` requirement is literal, so a monorepo is not detected: a crate at `repo/rust-app/` with the repository's `.git` one level up will not match.
+`--dependencies` removes trees that a package manager can fetch again. They are
+reported separately from build artifacts because restoring them may need
+network access, credentials, or post-install hooks.
+
+| Removed | Marker file beside it | Restored by |
+|-|-|-|
+| `.venv/` | `uv.lock` | `uv sync` |
+| `node_modules/` | `package-lock.json`, `npm-shrinkwrap.json` | `npm ci` |
+| `node_modules/` | `yarn.lock` | `yarn install --immutable` |
+| `node_modules/` | `pnpm-lock.yaml` | `pnpm install --frozen-lockfile` |
+| `node_modules/` | `bun.lock`, `bun.lockb` | `bun install --frozen-lockfile` |
+| `vendor/` | `go.mod` | `go mod vendor` |
+
+The list is three ecosystems, not every ecosystem. A wrong entry deletes a tree
+that cannot be rebuilt, so it stays where the restore command is known and the
+layout is conventional. Other ecosystems are a pattern in `.cclean.toml`, which
+matches by name without a marker and so is the user's own judgement to make.
+
+Each marker is the file that pins versions, not the one that declares them.
+`uv.lock` rather than `pyproject.toml`, which poetry, pdm and hatch also write
+and which sits beside pip-populated virtualenvs. `package-lock.json` rather
+than `package.json`, which carries ranges: only the lock names a tree, and only
+`npm ci` reinstalls it exactly. `go.mod` needs no companion, because minimal
+version selection makes it deterministic on its own.
+
+`node_modules/` has a row per package manager because they share the install
+directory but not the lock name. A `node_modules/` with no lock beside it is
+left alone, since nothing on disk says what tree to put back.
+
+bun has two entries because it changed format: `bun.lockb` is the binary lock
+it wrote before 1.2, `bun.lock` the text one it writes now. Both still install.
+
+Lock names outside this list are a `dependency_markers` entry. Deno writes
+`deno.lock` beside a `node_modules/` when it manages one:
+
+```toml
+dependencies = true
+dependency_markers = [["node_modules", "deno.lock"]]
+```
+
+Two things `--dependencies` does not preserve. Edits made directly inside a
+dependency tree are lost, since the manager rewrites it from the registry;
+patched `vendor/` source is the usual case. And for Go, the presence of
+`vendor/` is itself build configuration: removing it makes the build fall back
+to the module cache or the network.
+
+The `.git` requirement is literal, so a monorepo is not detected unless its
+package roots are listed in `project_roots` in `.cclean.toml`.
 
 This project now matches its own rule. Running `cclean -b` at the top of this
 repository will offer to delete `build/`, because `.git` and `CMakeLists.txt`
@@ -153,9 +247,9 @@ sit beside it. That is correct, and `make` regenerates it.
 cclean . --exclude .venv --exclude "**/fixtures/**"
 ```
 
-An exclude prunes: naming a directory keeps everything inside it, not just the directory itself. That is what makes `--exclude .venv` protect a virtual environment, which the built-in list no longer does.
+An exclude prunes: naming a directory keeps everything inside it, not just the directory itself. That is what makes `--exclude .venv` protect a virtual environment, which the built-in skip list does not. A `.venv` is only ever removed whole under `--dependencies`, and then only beside a `uv.lock`.
 
-Excludes are tested the way command-line patterns are, against the path relative to `ROOT` and against the final path component. They apply to built-in patterns, command-line patterns, and `--build-artifacts` alike.
+Excludes are tested the way command-line patterns are, against the path relative to `ROOT` and against the final path component. They apply to built-in patterns, command-line patterns, build artifacts, and dependency candidates alike.
 
 ## Patterns
 
@@ -176,6 +270,9 @@ The prompt takes a single keypress, with no Enter. `y` or `Y` proceeds; anything
 When standard input is a pipe, a character is read from it instead, so
 `echo y | cclean .` works in scripts.
 
+`--yes` skips confirmation and is intended for explicitly unattended runs. It
+never changes the default behavior.
+
 ## Output
 
 Progress appears on standard error during long scans and is erased when they finish. Nothing is drawn for the first 80 milliseconds, so quick runs stay silent. The target list goes to standard output, so redirecting it leaves a clean file.
@@ -184,17 +281,29 @@ Colour is used for directories, totals, and failures. It is disabled automatical
 
 The matched list is printed once. After confirmation you get a one-line summary; only failures are named again. `--verbose` restores the per-item log.
 
+`--format json` writes one JSON document to standard output. It includes the
+root, status, matched targets, logical byte totals, per-reason statistics, and
+warnings. Progress, prompts, and other diagnostics go to standard error. Each
+target includes a `reason`: `default`, `config`, `command-line`,
+`build-artifact`, or `dependency`.
+
 ### Exit codes
 
 | Code | Meaning |
 |-|-|
-| 0 | Removed cleanly, or nothing matched, or cancelled, or dry run |
-| 1 | `ROOT` is missing or is not a directory, or a removal failed |
-| 2 | Bad option, or no patterns left to match |
+| 0 | Scan completed; removal succeeded, nothing matched, cancellation, or dry run |
+| 1 | `ROOT` cannot be inspected, a scan warning occurred, or a removal failed |
+| 2 | Bad option, invalid configuration, or no patterns left to match |
 
 ## Sizes
 
 Reported sizes are logical file sizes, not disk usage. They ignore block rounding, sparse files, and filesystem compression, so the space actually reclaimed may differ.
+
+`--older-than` drops targets younger than the duration. Durations use `s`,
+`m`, `h`, `d`, or `w`. For directories, the newest entry in the directory
+determines its age. `--larger-than` keeps only targets at or above the given
+logical size. Sizes use bytes by default, or binary `K`, `M`, `G`, or `T`
+suffixes.
 
 Directories are sized in parallel across all cores. The unit of work is a single directory level rather than a whole target, so one large `node_modules` parallelizes as well as a thousand small `__pycache__` directories.
 
@@ -202,7 +311,7 @@ The tree walk uses the same work queue, so listing directories is spread across 
 
 ## Limitations
 
-- Unreadable directories are skipped silently rather than reported.
+- Unreadable directories are reported as warnings and make the command exit
+  with status 1. The root itself must be readable.
 
 - Pointing `ROOT` directly at a protected directory scans it. The skip list applies to entries found during the walk, not to `ROOT` itself.
-
