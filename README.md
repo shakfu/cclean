@@ -2,7 +2,7 @@
 
 Finds and removes build caches and editor debris from a directory tree. It lists everything it matched, with sizes, and waits for confirmation before deleting anything.
 
-```
+```text
 $ cclean --dry-run api
 
 Matched targets:
@@ -17,23 +17,22 @@ Dry run: nothing was removed.
 
 Without `--dry-run` it prints the same list, then asks:
 
-```
+```text
 Permanently remove? [y/N] y
 Removed 4, 1.43 MiB reclaimed
 ```
 
 ## Build
 
-The build is defined by `CMakeLists.txt`. The `Makefile` is a frontend over it,
-so either entry point works.
+The build is defined by `CMakeLists.txt`. The `Makefile` is a frontend over it, so either entry point works.
 
-```
+```text
 make                    # configure and build into build/
 make install            # install to /usr/local, stripped
 make clean              # remove build/
 ```
 
-```
+```text
 cmake -S . -B build
 cmake --build build --parallel
 cmake --install build --strip
@@ -41,21 +40,18 @@ cmake --install build --strip
 
 Both honour the usual overrides:
 
-```
+```text
 make BUILD=out BUILD_TYPE=Debug
 make install PREFIX=$HOME/.local
 ```
 
-The version reported by `cclean --version` comes from `project(... VERSION ...)`
-in `CMakeLists.txt`, passed to the compiler as a definition. A build made
-outside CMake reports `unknown`.
+The version reported by `cclean --version` comes from `project(... VERSION ...)` in `CMakeLists.txt`, passed to the compiler as a definition. A build made outside CMake reports `unknown`.
 
-Requires CMake 3.16 and a C++17 compiler. No dependencies beyond the standard
-library and pthreads. POSIX only: the confirmation prompt uses `<termios.h>`.
+Requires CMake 3.16 and a C++17 compiler. No dependencies beyond the standard library and pthreads. POSIX only: the confirmation prompt uses `<termios.h>`.
 
 ## Tests
 
-```
+```text
 make test               # or: ctest --test-dir build --output-on-failure
 ```
 
@@ -69,13 +65,13 @@ Both exit non-zero on failure, so `make test` fails the build. The terminal bran
 
 ## Usage
 
-```
+```text
 cclean [OPTION ...] ROOT [PATTERN ...]
 ```
 
 `ROOT` defaults to the working directory. Patterns given on the command line are added to the built-in set, never substituted for it.
 
-```
+```text
 cclean                                    # scan the working directory
 cclean ./project                          # scan one project
 cclean --dry-run ./project "*.log"        # add a pattern, remove nothing
@@ -103,14 +99,9 @@ cclean --no-defaults . "build/**"         # only what is named here
 
 ### Configuration
 
-cclean searches from `ROOT` upward for the first `.cclean.toml`. It does not
-read configuration from outside that ancestor chain. CLI options override
-configuration values. CLI exclude patterns replace configured excludes when at
-least one `--exclude` is supplied; command-line patterns are added after
-configured patterns.
+cclean searches from `ROOT` upward for the first `.cclean.toml`. It does not read configuration from outside that ancestor chain. CLI options override configuration values. CLI exclude patterns replace configured excludes when at least one `--exclude` is supplied; command-line patterns are added after configured patterns.
 
-The supported schema is deliberately small and rejects unknown keys or invalid
-values:
+The supported schema is deliberately small and rejects unknown keys or invalid values:
 
 ```toml
 patterns = ["*.tmp", "**/generated/**"]
@@ -125,27 +116,15 @@ older_than = "30d"
 larger_than = "100M"
 ```
 
-`patterns`, `excludes`, and `project_roots` are arrays of strings;
-`dependency_markers` is an array of two-string arrays. The other values are
-booleans or quoted filter values. Configuration errors exit with status 2
-before scanning starts.
+`patterns`, `excludes`, and `project_roots` are arrays of strings; `dependency_markers` is an array of two-string arrays. The other values are booleans or quoted filter values. Configuration errors exit with status 2 before scanning starts.
 
-`dependency_markers` adds ecosystems the built-in list leaves out. Each entry
-is a directory name and the marker file that must sit beside it, both plain
-names rather than paths, since the marker is looked up in the directory's
-parent. A configured pair takes the same marker guard and the same
-`--dependencies` gate as a built-in, which is what distinguishes it from a
-pattern: `patterns = ["deps"]` matches any directory of that name, on every
-run.
+`dependency_markers` adds ecosystems the built-in list leaves out. Each entry is a directory name and the marker file that must sit beside it, both plain names rather than paths, since the marker is looked up in the directory's parent. A configured pair takes the same marker guard and the same `--dependencies` gate as a built-in, which is what distinguishes it from a pattern: `patterns = ["deps"]` matches any directory of that name, on every run.
 
-Project roots let marker files identify package projects inside a monorepo.
-They are relative to the directory holding `.cclean.toml`, not to `ROOT`, so
-one repository-level file serves every `ROOT` beneath it; an entry outside the
-`ROOT` of a given run simply never matches.
+Project roots let marker files identify package projects inside a monorepo. They are relative to the directory holding `.cclean.toml`, not to `ROOT`, so one repository-level file serves every `ROOT` beneath it; an entry outside the `ROOT` of a given run simply never matches.
 
 ## What it removes by default
 
-```
+```text
 __pycache__   *.pyc   *.pyo   .*_cache   .DS_Store
 ```
 
@@ -155,7 +134,7 @@ __pycache__   *.pyc   *.pyo   .*_cache   .DS_Store
 
 These directories are neither matched nor descended into:
 
-```
+```text
 .git   .hg   .svn   .config   .ssh   .gnupg
 ```
 
@@ -186,9 +165,7 @@ The directory must also be top-level in the outermost project. A submodule or a 
 
 `node_modules/` is deliberately absent. It is dependencies rather than build output, and restoring it needs the network, where everything above rebuilds offline. Remove it with a pattern if you want to: `cclean . node_modules`.
 
-`--dependencies` removes trees that a package manager can fetch again. They are
-reported separately from build artifacts because restoring them may need
-network access, credentials, or post-install hooks.
+`--dependencies` removes trees that a package manager can fetch again. They are reported separately from build artifacts because restoring them may need network access, credentials, or post-install hooks.
 
 | Removed | Marker file beside it | Restored by |
 |-|-|-|
@@ -199,51 +176,32 @@ network access, credentials, or post-install hooks.
 | `node_modules/` | `bun.lock`, `bun.lockb` | `bun install --frozen-lockfile` |
 | `vendor/` | `go.mod` | `go mod vendor` |
 
-The list is three ecosystems, not every ecosystem. A wrong entry deletes a tree
-that cannot be rebuilt, so it stays where the restore command is known and the
-layout is conventional. Other ecosystems are a pattern in `.cclean.toml`, which
-matches by name without a marker and so is the user's own judgement to make.
+The list is three ecosystems, not every ecosystem. A wrong entry deletes a tree that cannot be rebuilt, so it stays where the restore command is known and the layout is conventional. Other ecosystems are a pattern in `.cclean.toml`, which matches by name without a marker and so is the user's own judgement to make.
 
-Each marker is the file that pins versions, not the one that declares them.
-`uv.lock` rather than `pyproject.toml`, which poetry, pdm and hatch also write
-and which sits beside pip-populated virtualenvs. `package-lock.json` rather
-than `package.json`, which carries ranges: only the lock names a tree, and only
-`npm ci` reinstalls it exactly. `go.mod` needs no companion, because minimal
-version selection makes it deterministic on its own.
+Each marker is the file that pins versions, not the one that declares them. `uv.lock` rather than `pyproject.toml`, which poetry, pdm and hatch also write and which sits beside pip-populated virtualenvs. `package-lock.json` rather than `package.json`, which carries ranges: only the lock names a tree, and only `npm ci` reinstalls it exactly. `go.mod` needs no companion, because minimal version selection makes it deterministic on its own.
 
-`node_modules/` has a row per package manager because they share the install
-directory but not the lock name. A `node_modules/` with no lock beside it is
-left alone, since nothing on disk says what tree to put back.
+`node_modules/` has a row per package manager because they share the install directory but not the lock name. A `node_modules/` with no lock beside it is left alone, since nothing on disk says what tree to put back.
 
-bun has two entries because it changed format: `bun.lockb` is the binary lock
-it wrote before 1.2, `bun.lock` the text one it writes now. Both still install.
+bun has two entries because it changed format: `bun.lockb` is the binary lock it wrote before 1.2, `bun.lock` the text one it writes now. Both still install.
 
-Lock names outside this list are a `dependency_markers` entry. Deno writes
-`deno.lock` beside a `node_modules/` when it manages one:
+Lock names outside this list are a `dependency_markers` entry. Deno writes `deno.lock` beside a `node_modules/` when it manages one:
 
 ```toml
 dependencies = true
 dependency_markers = [["node_modules", "deno.lock"]]
 ```
 
-Two things `--dependencies` does not preserve. Edits made directly inside a
-dependency tree are lost, since the manager rewrites it from the registry;
-patched `vendor/` source is the usual case. And for Go, the presence of
-`vendor/` is itself build configuration: removing it makes the build fall back
-to the module cache or the network.
+Two things `--dependencies` does not preserve. Edits made directly inside a dependency tree are lost, since the manager rewrites it from the registry; patched `vendor/` source is the usual case. And for Go, the presence of `vendor/` is itself build configuration: removing it makes the build fall back to the module cache or the network.
 
-The `.git` requirement is literal, so a monorepo is not detected unless its
-package roots are listed in `project_roots` in `.cclean.toml`.
+The `.git` requirement is literal, so a monorepo is not detected unless its package roots are listed in `project_roots` in `.cclean.toml`.
 
-This project now matches its own rule. Running `cclean -b` at the top of this
-repository will offer to delete `build/`, because `.git` and `CMakeLists.txt`
-sit beside it. That is correct, and `make` regenerates it.
+This project now matches its own rule. Running `cclean -b` at the top of this repository will offer to delete `build/`, because `.git` and `CMakeLists.txt` sit beside it. That is correct, and `make` regenerates it.
 
 ## Excluding
 
 `--exclude` keeps anything matching a pattern, and is repeatable.
 
-```
+```text
 cclean . --exclude .venv --exclude "**/fixtures/**"
 ```
 
@@ -270,8 +228,7 @@ The prompt takes a single keypress, with no Enter. `y` or `Y` proceeds; anything
 When standard input is a pipe, a character is read from it instead, so
 `echo y | cclean .` works in scripts.
 
-`--yes` skips confirmation and is intended for explicitly unattended runs. It
-never changes the default behavior.
+`--yes` skips confirmation and is intended for explicitly unattended runs. It never changes the default behavior.
 
 ## Output
 
@@ -281,11 +238,7 @@ Colour is used for directories, totals, and failures. It is disabled automatical
 
 The matched list is printed once. After confirmation you get a one-line summary; only failures are named again. `--verbose` restores the per-item log.
 
-`--format json` writes one JSON document to standard output. It includes the
-root, status, matched targets, logical byte totals, per-reason statistics, and
-warnings. Progress, prompts, and other diagnostics go to standard error. Each
-target includes a `reason`: `default`, `config`, `command-line`,
-`build-artifact`, or `dependency`.
+`--format json` writes one JSON document to standard output. It includes the root, status, matched targets, logical byte totals, per-reason statistics, and warnings. Progress, prompts, and other diagnostics go to standard error. Each target includes a `reason`: `default`, `config`, `command-line`, `build-artifact`, or `dependency`.
 
 ### Exit codes
 
@@ -299,11 +252,7 @@ target includes a `reason`: `default`, `config`, `command-line`,
 
 Reported sizes are logical file sizes, not disk usage. They ignore block rounding, sparse files, and filesystem compression, so the space actually reclaimed may differ.
 
-`--older-than` drops targets younger than the duration. Durations use `s`,
-`m`, `h`, `d`, or `w`. For directories, the newest entry in the directory
-determines its age. `--larger-than` keeps only targets at or above the given
-logical size. Sizes use bytes by default, or binary `K`, `M`, `G`, or `T`
-suffixes.
+`--older-than` drops targets younger than the duration. Durations use `s`, `m`, `h`, `d`, or `w`. For directories, the newest entry in the directory determines its age. `--larger-than` keeps only targets at or above the given logical size. Sizes use bytes by default, or binary `K`, `M`, `G`, or `T` suffixes.
 
 Directories are sized in parallel across all cores. The unit of work is a single directory level rather than a whole target, so one large `node_modules` parallelizes as well as a thousand small `__pycache__` directories.
 
@@ -311,7 +260,6 @@ The tree walk uses the same work queue, so listing directories is spread across 
 
 ## Limitations
 
-- Unreadable directories are reported as warnings and make the command exit
-  with status 1. The root itself must be readable.
+- Unreadable directories are reported as warnings and make the command exit with status 1. The root itself must be readable.
 
 - Pointing `ROOT` directly at a protected directory scans it. The skip list applies to entries found during the walk, not to `ROOT` itself.

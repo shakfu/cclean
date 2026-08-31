@@ -12,57 +12,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - `-y, --yes` for explicit unattended deletion. The default confirmation prompt remains unchanged.
 
-- `--older-than` and `--larger-than` filters, with equivalent configuration
-  values. Directory age uses the newest entry in the target.
+- `--older-than` and `--larger-than` filters, with equivalent configuration values. Directory age uses the newest entry in the target.
 
-- `--dependencies` for marker-guarded `.venv` beside `uv.lock`, `node_modules`
-  beside `package-lock.json`, and `vendor` beside `go.mod`. Dependency targets remain
-  separate from rebuildable artifacts. Three ecosystems rather than every
-  ecosystem: a wrong entry deletes a tree that cannot be rebuilt, and other
-  ecosystems are a pattern in `.cclean.toml`. `uv.lock` over `pyproject.toml`,
-  which poetry, pdm and hatch also write and which sits beside pip-populated
-  virtualenvs, and a lock file over `package.json`. `node_modules` carries one
-  row per package manager, `package-lock.json`, `npm-shrinkwrap.json`,
-  `yarn.lock`, `pnpm-lock.yaml`, `bun.lock` and `bun.lockb`, because they share
-  the install directory but not the lock name.
+- `--dependencies` for marker-guarded `.venv` beside `uv.lock`, `node_modules` beside `package-lock.json`, and `vendor` beside `go.mod`. Dependency targets remain separate from rebuildable artifacts. Three ecosystems rather than every ecosystem: a wrong entry deletes a tree that cannot be rebuilt, and other ecosystems are a pattern in `.cclean.toml`. `uv.lock` over `pyproject.toml`, which poetry, pdm and hatch also write and which sits beside pip-populated virtualenvs, and a lock file over `package.json`. `node_modules` carries one row per package manager, `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lock` and `bun.lockb`, because they share the install directory but not the lock name.
 
-- `dependency_markers` in `.cclean.toml`, an array of `[directory, marker]`
-  pairs, for ecosystems the built-in list leaves out. A configured pair takes
-  the same marker guard and the same `--dependencies` gate as a built-in;
-  a pattern would match the directory name on every run, unguarded.
+- `dependency_markers` in `.cclean.toml`, an array of `[directory, marker]` pairs, for ecosystems the built-in list leaves out. A configured pair takes the same marker guard and the same `--dependencies` gate as a built-in; a pattern would match the directory name on every run, unguarded.
 
-- Explicit `project_roots` configuration for marker-guarded artifacts inside
-  monorepos. Entries resolve against the directory holding `.cclean.toml`, so
-  one repository-level file serves every `ROOT` beneath it.
+- Explicit `project_roots` configuration for marker-guarded artifacts inside monorepos. Entries resolve against the directory holding `.cclean.toml`, so one repository-level file serves every `ROOT` beneath it.
 
 ### Changed
 
 - Scan warnings now produce exit status 1. Status 2 covers invalid options, invalid configuration, and runs with no patterns.
 
-- Unreadable paths are reported instead of skipped silently. Targets are
-  revalidated before deletion to reject paths whose type changed after scanning.
+- Unreadable paths are reported instead of skipped silently. Targets are revalidated before deletion to reject paths whose type changed after scanning.
 
-- `make` decides what to recompile from a checksum of the sources rather than
-  from mtimes alone. CMake's Makefile generator compares timestamps at
-  one-second granularity, so an edit landing in the same second as the previous
-  build was invisible and `make test` then exercised a stale binary: an
-  edit-then-build loop missed 3 of 10 changes.
+- `make` decides what to recompile from a checksum of the sources rather than from mtimes alone. CMake's Makefile generator compares timestamps at one-second granularity, so an edit landing in the same second as the previous build was invisible and `make test` then exercised a stale binary: an edit-then-build loop missed 3 of 10 changes.
 
 ### Fixed
 
-- An unreadable modification time no longer warns or sets exit status 1 on its
-  own. The value is consulted only by `--older-than`, which reports
-  `Cannot apply age filter` for the same target and drops it, so the earlier
-  warning fired for a value the run never read and turned successful runs
-  without the filter into status 1.
+- An unreadable modification time no longer warns or sets exit status 1 on its own. The value is consulted only by `--older-than`, which reports `Cannot apply age filter` for the same target and drops it, so the earlier warning fired for a value the run never read and turned successful runs without the filter into status 1.
 
-- A throwing scan callback in the parallel walk and sizing driver no longer
-  deadlocks or aborts. Every scan takes the `error_code` overloads and so does
-  not throw today, but a throw skipped the active-worker decrement, leaving a
-  count that could never reach zero and the remaining workers parked on it,
-  and then escaped a thread function into `std::terminate`. The first
-  exception is now captured, the walk abandoned, and the exception rethrown to
-  the caller once the pool is joined.
+- A throwing scan callback in the parallel walk and sizing driver no longer deadlocks or aborts. Every scan takes the `error_code` overloads and so does not throw today, but a throw skipped the active-worker decrement, leaving a count that could never reach zero and the remaining workers parked on it, and then escaped a thread function into `std::terminate`. The first exception is now captured, the walk abandoned, and the exception rethrown to the caller once the pool is joined.
 
 ## [0.1.1]
 
@@ -112,6 +82,4 @@ Glob matching is open-coded rather than translated to `std::regex`. Regex was 25
 
 A matched directory is removed whole and is not descended into, so its contents appear in neither the walk nor the listing. Counting a directory and the matched files inside it separately doubles the reported total.
 
-[0.2.0]: https://github.com/shakfu/cclean/releases/tag/0.2.0
-[0.1.1]: https://github.com/shakfu/cclean/releases/tag/0.1.1
-[0.1.0]: https://github.com/shakfu/cclean/releases/tag/0.1.0
+[0.2.0]: <https://github.com/shakfu/cclean/releases/tag/0.2.0> [0.1.1]: <https://github.com/shakfu/cclean/releases/tag/0.1.1> [0.1.0]: <https://github.com/shakfu/cclean/releases/tag/0.1.0>
