@@ -145,8 +145,8 @@ mkdir -p "$d/sub"
 printf 'x' > "$d/remove.tmp"
 printf 'x' > "$d/keep.pyc"
 printf 'x' > "$d/sub/cache.pyc"
-printf 'patterns = [\"*.tmp\"]\n' > "$d/.cclean.toml"
-printf 'excludes = [\"keep.pyc\"]\n' >> "$d/.cclean.toml"
+printf 'patterns = ["*.tmp"]\n' > "$d/.cclean.toml"
+printf 'excludes = ["keep.pyc"]\n' >> "$d/.cclean.toml"
 printf 'defaults = true\n' >> "$d/.cclean.toml"
 
 check "config adds patterns and defaults" "2 targets, 2 B to reclaim" \
@@ -163,7 +163,7 @@ check "unknown config key exits 2" 2 $?
 # A # opens a comment only outside quotes; emacs lock and autosave files are
 # named with it.
 printf 'x' > "$d/#locked#"
-printf 'patterns = [\"#*#\"]  # trailing comment\n' > "$d/.cclean.toml"
+printf 'patterns = ["#*#"]  # trailing comment\n' > "$d/.cclean.toml"
 printf 'defaults = false\n' >> "$d/.cclean.toml"
 check "quoted # is not a comment" 1 "$($CCLEAN -n "$d" | grep -c 'locked')"
 
@@ -173,7 +173,7 @@ mkdir -p "$d/packages/app/build"
 printf 'x' > "$d/packages/app/CMakeLists.txt"
 printf 'xx' > "$d/packages/app/build/out"
 mkdir -p "$d/packages/other"
-printf 'project_roots = [\"packages/app\", \"packages/other\"]\n' > "$d/.cclean.toml"
+printf 'project_roots = ["packages/app", "packages/other"]\n' > "$d/.cclean.toml"
 check "configured monorepo project is detected" \
       "1 target, 2 B to reclaim" "$(cd "$d" && "$CCLEAN" -n -b . | grep 'to reclaim')"
 
@@ -188,7 +188,7 @@ check "config from a parent does not break a plain run" 0 $?
 (cd "$d" && "$CCLEAN" -n -b packages/app >/dev/null 2>&1)
 check "project_roots survive a ROOT below the config" 0 $?
 
-printf 'project_roots = [\"../escape\"]\n' > "$d/.cclean.toml"
+printf 'project_roots = ["../escape"]\n' > "$d/.cclean.toml"
 "$CCLEAN" -n "$d" >/dev/null 2>&1
 check "project_roots escaping the config directory exits 2" 2 $?
 rm -f "$d/.cclean.toml"
@@ -296,7 +296,7 @@ printf 'xx' > "$d/plain/deps/f"
 printf 'x' > "$d/skipme/mix.exs"
 printf 'xx' > "$d/skipme/deps/f"
 printf 'dependencies = true\n' > "$d/.cclean.toml"
-printf 'dependency_markers = [[\"deps\", \"mix.exs\"]]\n' >> "$d/.cclean.toml"
+printf 'dependency_markers = [["deps", "mix.exs"]]\n' >> "$d/.cclean.toml"
 
 check "configured dependency pair is matched" 1 \
       "$($CCLEAN -n --no-defaults "$d" | grep -c 'app/deps/')"
@@ -308,19 +308,19 @@ check "configured pair honours excludes" 0 \
 # The gate is the flag, not the key: turning dependencies off in the config
 # leaves the configured pairs inert.
 printf 'dependencies = false\n' > "$d/.cclean.toml"
-printf 'dependency_markers = [[\"deps\", \"mix.exs\"]]\n' >> "$d/.cclean.toml"
+printf 'dependency_markers = [["deps", "mix.exs"]]\n' >> "$d/.cclean.toml"
 check "configured pairs are gated by --dependencies" 0 \
       "$($CCLEAN -n "$d" | grep -c 'app/deps/')"
 check "the flag re-enables configured pairs" 1 \
       "$($CCLEAN -n --dependencies "$d" | grep -c 'app/deps/')"
 
 # A marker is looked up beside the directory, so it has to be a plain name.
-for bad in 'dependency_markers = [\"deps\"]' \
-           'dependency_markers = [[\"deps\"]]' \
-           'dependency_markers = [[\"deps\", \"a\", \"b\"]]' \
-           'dependency_markers = [[\"deps\", \"../mix.exs\"]]' \
-           'dependency_markers = [[\"\", \"mix.exs\"]]'; do
-    printf '%b\n' "$bad" > "$d/.cclean.toml"
+for bad in 'dependency_markers = ["deps"]' \
+           'dependency_markers = [["deps"]]' \
+           'dependency_markers = [["deps", "a", "b"]]' \
+           'dependency_markers = [["deps", "../mix.exs"]]' \
+           'dependency_markers = [["", "mix.exs"]]'; do
+    printf '%s\n' "$bad" > "$d/.cclean.toml"
     "$CCLEAN" -n "$d" >/dev/null 2>&1
     check "malformed dependency_markers exits 2: $bad" 2 $?
 done

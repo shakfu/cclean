@@ -2,7 +2,7 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.0]
 
 ### Added
 
@@ -47,6 +47,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
   one-second granularity, so an edit landing in the same second as the previous
   build was invisible and `make test` then exercised a stale binary: an
   edit-then-build loop missed 3 of 10 changes.
+
+### Fixed
+
+- An unreadable modification time no longer warns or sets exit status 1 on its
+  own. The value is consulted only by `--older-than`, which reports
+  `Cannot apply age filter` for the same target and drops it, so the earlier
+  warning fired for a value the run never read and turned successful runs
+  without the filter into status 1.
+
+- A throwing scan callback in the parallel walk and sizing driver no longer
+  deadlocks or aborts. Every scan takes the `error_code` overloads and so does
+  not throw today, but a throw skipped the active-worker decrement, leaving a
+  count that could never reach zero and the remaining workers parked on it,
+  and then escaped a thread function into `std::terminate`. The first
+  exception is now captured, the walk abandoned, and the exception rethrown to
+  the caller once the pool is joined.
 
 ## [0.1.1]
 
@@ -96,5 +112,6 @@ Glob matching is open-coded rather than translated to `std::regex`. Regex was 25
 
 A matched directory is removed whole and is not descended into, so its contents appear in neither the walk nor the listing. Counting a directory and the matched files inside it separately doubles the reported total.
 
+[0.2.0]: https://github.com/shakfu/cclean/releases/tag/0.2.0
 [0.1.1]: https://github.com/shakfu/cclean/releases/tag/0.1.1
 [0.1.0]: https://github.com/shakfu/cclean/releases/tag/0.1.0

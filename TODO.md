@@ -4,7 +4,7 @@
 
 - [x] **`--dependencies`**: Marker-guarded dependency trees are handled separately from build artifacts because restoration may require a network, registry access, credentials, or post-install state.
 
-- [x] **Config file**: `.cclean.toml` stores patterns, excludes, defaults, build-artifact selection, and protected-directory selection. It is discovered upward from `ROOT`, and CLI values take precedence.
+- [x] **Config file**: `.cclean.toml` stores `patterns`, `excludes`, `defaults`, `build_artifacts`, `dependencies`, `skip_protected`, `dependency_markers`, `project_roots`, `older_than` and `larger_than`. `skip_protected` mirrors `--no-skip`, disabling the protected list wholesale; the list itself cannot be extended or replaced from configuration. It is discovered upward from `ROOT`, and CLI values take precedence.
 
 - [x] **`--format json`**: Machine-readable output for scripting, including target
   reasons and per-reason statistics. Diagnostics remain on stderr.

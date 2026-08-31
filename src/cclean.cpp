@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
 #include <filesystem>
 #include <iostream>
@@ -943,6 +944,15 @@ static std::uintmax_t file_size_or_zero(
 // up back into the queue. `scan` is responsible for its own results and their
 // synchronisation; this only distributes the work.
 //
+// A throwing `scan` is caught rather than allowed to escape. Every scan here
+// takes the `error_code` overloads and so does not throw today, but the
+// consequences of one that did are out of proportion to the mistake: the
+// worker would skip the `--active` below, leaving a count that can never reach
+// zero and every other worker parked on it forever, and the exception would
+// then escape a thread function and call std::terminate. Catching keeps the
+// bookkeeping on one path, and the first exception is rethrown to the caller
+// once the pool is joined, so the failure surfaces as it would have serially.
+//
 //   scan(const Job&, std::vector<Job>& children)
 template <typename Job, typename Scan>
 static void parallel_directories(std::vector<Job> queue, Scan scan) {
@@ -953,6 +963,7 @@ static void parallel_directories(std::vector<Job> queue, Scan scan) {
     std::mutex mutex;
     std::condition_variable ready;
     std::size_t active = 0;
+    std::exception_ptr failure;
 
     const auto worker = [&] {
         std::unique_lock<std::mutex> lock(mutex);
@@ -973,13 +984,32 @@ static void parallel_directories(std::vector<Job> queue, Scan scan) {
             lock.unlock();
 
             std::vector<Job> children;
-            scan(job, children);
+            std::exception_ptr caught;
+
+            try {
+                scan(job, children);
+            } catch (...) {
+                caught = std::current_exception();
+                children.clear();
+            }
 
             lock.lock();
 
-            queue.insert(queue.end(),
-                         std::make_move_iterator(children.begin()),
-                         std::make_move_iterator(children.end()));
+            if (caught && !failure) {
+                failure = caught;
+            }
+
+            if (failure) {
+                // Abandon the walk. Workers still inside `scan` rejoin through
+                // this same path, and those already waiting wake once `active`
+                // reaches zero.
+                queue.clear();
+            } else {
+                queue.insert(queue.end(),
+                             std::make_move_iterator(children.begin()),
+                             std::make_move_iterator(children.end()));
+            }
+
             --active;
 
             if (!queue.empty() || active == 0) {
@@ -1005,6 +1035,10 @@ static void parallel_directories(std::vector<Job> queue, Scan scan) {
 
     for (std::thread& thread : pool) {
         thread.join();
+    }
+
+    if (failure) {
+        std::rethrow_exception(failure);
     }
 }
 
@@ -1428,13 +1462,14 @@ static void scan_tree(
                 target.path = path;
                 target.is_directory = is_directory;
                 target.is_symlink = is_symlink;
+                // An unreadable mtime is recorded, not reported. It is only
+                // ever consulted by --older-than, which raises its own
+                // "Cannot apply age filter" error for the same target; warning
+                // here as well made every run without the filter exit 1 over a
+                // value it never read.
                 std::error_code time_ec;
                 target.newest_time = entry.last_write_time(time_ec);
                 target.has_time = !time_ec;
-                if (time_ec) {
-                    local.push_back("Cannot determine modification time of " +
-                                    path.string() + ": " + time_ec.message());
-                }
                 if (artifact) {
                     target.reason = "build-artifact";
                 } else if (dependency) {

@@ -4,8 +4,10 @@
 // source directly and rename its entry point out of the way. That keeps the
 // program a single file while still reaching the static functions.
 
+#include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <stdexcept>
 #include <fstream>
 #include <string>
 
@@ -557,6 +559,50 @@ void test_artifact_detection() {
     CHECK(is_artifact_directory(submodule / "build", "build", tree.root()));
 }
 
+// ------------------------------------------------- parallel_directories
+
+// A scan that throws must not strand the worker count or reach a thread
+// boundary. The exception is expected to come back out of the call, and the
+// call is expected to return at all: before this was handled, a throw left
+// `active` raised and the remaining workers waiting on it forever.
+void test_parallel_scan_propagates_exceptions() {
+    group("parallel_directories");
+
+    // Enough work that the throw lands while other workers are still running.
+    std::vector<int> queue;
+    for (int i = 0; i < 64; ++i) {
+        queue.push_back(i);
+    }
+
+    std::atomic<int> scanned{0};
+    bool threw = false;
+
+    try {
+        parallel_directories(queue, [&](int job, std::vector<int>& children) {
+            ++scanned;
+            if (job == 7) {
+                throw std::runtime_error("scan failed");
+            }
+            // Two levels of children, so the queue is not merely drained.
+            if (job < 8) {
+                children.push_back(100 + job);
+            }
+        });
+    } catch (const std::runtime_error& error) {
+        threw = true;
+        CHECK(std::string(error.what()) == "scan failed");
+    }
+
+    CHECK(threw);
+    // The walk is abandoned rather than run to completion.
+    CHECK(scanned.load() <= 64 + 8);
+
+    // A scan that does not throw still visits everything and still returns.
+    std::atomic<int> total{0};
+    parallel_directories(queue, [&](int, std::vector<int>&) { ++total; });
+    CHECK_EQ(total.load(), 64);
+}
+
 }  // namespace
 
 int main() {
@@ -577,6 +623,7 @@ int main() {
     test_format_size();
     test_saturating_add();
     test_artifact_detection();
+    test_parallel_scan_propagates_exceptions();
 
     if (g_failures == 0) {
         std::printf("unit: %d checks passed\n", g_checks);
