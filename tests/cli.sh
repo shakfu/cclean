@@ -823,7 +823,7 @@ rm -rf "$d"
 mkdir -p "$d"
 printf 'x' > "$d/fresh.txt"
 ln -s fresh.txt "$d/old.pyc"
-touch -h -d '2001-01-01' "$d/old.pyc"
+touch -h -d '2001-01-01T00:00:00' "$d/old.pyc"
 check "an old link to a fresh file is old" 1 \
       "$("$CCLEAN" -n --older-than 1d "$d" | grep -c 'old.pyc')"
 
@@ -900,7 +900,17 @@ check "a marker name containing a bracket is accepted" 0 \
 if command -v python3 >/dev/null 2>&1; then
     pty_answer() {
         python3 - "$CCLEAN" "$1" "$2" <<'PTY_DRIVER'
-import os, pty, sys, time
+# Reads the master continuously and only then sends the answer, which the
+# obvious sleep-write-read shape cannot do. tcsetattr(TCSAFLUSH) drains output
+# first, and on a pty that blocks until the master reads it; a keypress written
+# during that window is queued, then discarded by the same TCSAFLUSH, and the
+# program waits on a keypress that no longer exists. That deadlocks on macOS.
+#
+# The answer is re-sent until the process exits, so a keypress lost to the
+# flush is not the end of the run, and the deadline turns a genuine regression
+# into a failure rather than a hang. Still one byte at a time and never a
+# newline: what is under test is that a single keypress is enough.
+import os, pty, select, signal, sys, time
 
 command, root, answer = sys.argv[1], sys.argv[2], sys.argv[3]
 pid, fd = pty.fork()
@@ -908,20 +918,47 @@ pid, fd = pty.fork()
 if pid == 0:
     os.execv(command, ["cclean", root])
 
-time.sleep(0.3)
-os.write(fd, answer.encode())
-
 output = b""
-try:
-    while True:
-        chunk = os.read(fd, 4096)
+deadline = time.time() + 30
+sent = 0.0
+
+while time.time() < deadline:
+    readable, _, _ = select.select([fd], [], [], 0.05)
+
+    if readable:
+        try:
+            chunk = os.read(fd, 4096)
+        except OSError:
+            break
         if not chunk:
             break
         output += chunk
-except OSError:
-    pass
 
-os.waitpid(pid, 0)
+    if b"[y/N]" in output and time.time() - sent > 0.2:
+        sent = time.time()
+        try:
+            os.write(fd, answer.encode())
+        except OSError:
+            break
+
+    if os.waitpid(pid, os.WNOHANG)[0] != 0:
+        # Drain whatever the exit raced with.
+        while select.select([fd], [], [], 0.05)[0]:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            output += chunk
+        pid = 0
+        break
+
+if pid != 0:
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    sys.stderr.write("pty: the run did not finish\n")
+
 sys.stdout.write(output.decode("utf-8", "replace"))
 PTY_DRIVER
     }

@@ -6,11 +6,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- `libcclean`, a static library holding everything that finds, sizes and removes, with `cclean` reduced to a frontend over it. `make install` now installs `lib/libcclean.a` and the headers under `include/cclean/` beside the binary. The entry point is `scan()`, which walks a root, sizes matched directories, applies the age and size filters, and returns the targets sorted by path; `remove_target()` is the deletion boundary. The library touches no terminal, prints nothing of its own, and reads no environment variable.
+
 - A CI workflow: GCC and Clang on Linux and Clang on macOS, both suites under AddressSanitizer with UndefinedBehaviorSanitizer and under ThreadSanitizer, and a run as an unprivileged user so the permission tests are not silently no-ops under root.
 
-- Regression coverage for everything below: numeric limits at zero, at the maximum, and one past it; marker directories, FIFOs, symlinks, broken symlinks, and `.git` as a file; symlink timestamps; filenames containing newlines, escape sequences, and invalid UTF-8; malformed and duplicated configuration keys; and the terminal confirmation branch, driven through a pseudo-terminal. The suites go from 178 to 293 unit checks and from 136 to 175 command-line checks.
+- Regression coverage for everything below: numeric limits at zero, at the maximum, and one past it; marker directories, FIFOs, symlinks, broken symlinks, and `.git` as a file; symlink timestamps; filenames containing newlines, escape sequences, and invalid UTF-8; malformed and duplicated configuration keys; and the terminal confirmation branch, driven through a pseudo-terminal. The suites go from 178 to 309 unit checks and from 136 to 175 command-line checks.
 
 ### Changed
+
+- The program is split into `include/cclean` and `src` for the library, `cli` for the frontend, and one module per concern rather than a single 2,900-line translation unit. Command-line output is byte-identical across the flag, config, JSON, filter and error paths. The reason a target reports is carried on the pattern that matched it, replacing index arithmetic against two running counts that every caller had to keep in step with the order the patterns were built in. The unit suite links the library instead of including its source and renaming `main`.
 
 - The configuration parser rejects duplicate keys and empty array elements. Values were appended, so a key repeated by a bad merge widened what a run deleted, and every comma before the next value was skipped, so `patterns = [, "*.tmp"]` and `["*.a",,,"*.b"]` both parsed. A single trailing comma is still accepted, as TOML accepts it. Nested arrays are parsed structurally rather than by searching for the next `]`, so a marker name containing that character is no longer rejected.
 
@@ -23,6 +27,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The README states the contracts these changes settle: the accepted configuration subset rather than an implication of full TOML, how filenames are escaped in each output format, that a symlink is filtered on its own timestamp, and how deletion resolves a path.
 
 ### Fixed
+
+- The pseudo-terminal test driver reads the pty continuously instead of sleeping before it answers, which deadlocked `make test` on macOS. `tcsetattr(TCSAFLUSH)` drains output first, and on a pty that blocks until the master reads; the keypress written during that window was queued, then discarded by the same call, and the program waited on an answer that no longer existed. The driver also has a deadline, so a real regression fails rather than hangs.
+
+- `touch -h -d` in the command-line suite uses the ISO 8601 `T` form, which BSD `touch` requires and GNU `touch` accepts. The symlink-timestamp check could not run on macOS.
 
 - `--older-than` and `--larger-than` no longer perform an out-of-range floating-point conversion. Both parsed through `double` and range-checked against `static_cast<double>` of the integer maximum; neither maximum is representable, so the bound rounded up to the next power of two, and a value written at the boundary passed the check and then reached a conversion that is undefined in C++. In practice the limit came out as zero, so `--larger-than 18446744073709551615B` matched every file instead of none, which is the opposite of what a filter used as a safety boundary before deletion is for. Both are now converted exactly, as fixed-point decimals truncated toward zero, and a value that does not fit is rejected. An exponent, a sign, or any trailing character is likewise an error rather than a silently different limit.
 

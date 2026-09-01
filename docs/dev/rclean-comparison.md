@@ -8,18 +8,18 @@ This document has been revised three times as both tools changed. The first revi
 
 All figures below were re-measured in one session against both current binaries. rclean's walk came out slower here than the previous revision recorded (78 ms against 61 ms), so read these as same-session relative numbers rather than as absolutes comparable across revisions.
 
-This third revision (2026-08-31) updates the feature comparison for cclean 0.2.0, which closed most of the configurability gap: a config file, age and size filters, JSON output, unattended deletion, and marker-guarded dependency removal. **The measurements were not retaken.** Every timing, binary size, and build time below still describes the 0.1.1-era binary measured on 2026-08-29, against rclean 0.4.0, on macOS; rclean was not available on the machine where this revision was written. Source and test counts were refreshed on 2026-09-01; performance rows are marked where they are not.
+This third revision (2026-08-31) updates the feature comparison for cclean 0.2.0, which closed most of the configurability gap: a config file, age and size filters, JSON output, unattended deletion, and marker-guarded dependency removal. **The measurements were not retaken.** Every timing, binary size, and build time below still describes the 0.1.1-era binary measured on 2026-08-29, against rclean 0.4.0, on macOS; rclean was not available on the machine where this revision was written. Source and test counts were refreshed on 2026-09-01, after the split into a library and a frontend; performance rows are marked where they are not.
 
 ## Summary
 
 | | cclean | rclean |
 |-|-|-|
-| Language | C++17, one file | Rust, `src/` plus `tests/` |
-| Source | 2935 lines, plus 1825 of tests | 1487 lines, plus 1188 of tests |
+| Language | C++17, `libcclean` plus a CLI frontend | Rust, `src/` plus `tests/` |
+| Source | 3647 lines (2782 library, 865 frontend), plus 1956 of tests | 1487 lines, plus 1188 of tests |
 | Dependencies | none | 12 runtime, 2 dev |
 | Binary, stripped* | 93,680 bytes | 1,470,880 bytes |
 | Clean build* | 1.1 s | 17.9 s |
-| Automated tests | 25 unit functions (293 checks), 175 CLI checks | 69 tests |
+| Automated tests | 26 unit functions (309 checks), 175 CLI checks | 69 tests |
 | Dry run, 65,101 entries* | 61 ms | 78 ms |
 | Tree walk | parallel | parallel |
 | Directory sizing | parallel | parallel |

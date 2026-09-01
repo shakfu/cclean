@@ -3,7 +3,7 @@
 #
 #   make                 configure and build into build/
 #   make test            build, then run both suites through ctest
-#   make install         install to /usr/local by default
+#   make install         install the binary, the library and the headers
 #   make clean           remove build/
 #
 # Override the build directory or the install prefix on the command line:
@@ -22,7 +22,8 @@ BUILD_TYPE ?= Release
 # checksum over the sources decides instead, and a mismatch cleans the tree
 # before building. cksum is POSIX, so this needs nothing that CMake does not
 # already require.
-SOURCES := $(shell find src tests -type f 2>/dev/null | sort) CMakeLists.txt
+SOURCES := $(shell find include src cli tests -type f 2>/dev/null | sort) \
+           CMakeLists.txt
 STAMP = $(BUILD)/.source-checksum
 
 .PHONY: all build test install clean

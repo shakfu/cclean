@@ -32,6 +32,8 @@ make install            # install to /usr/local, stripped
 make clean              # remove build/
 ```
 
+`make install` places three things under the prefix: `bin/cclean`, `lib/libcclean.a`, and the headers under `include/cclean/`.
+
 ```text
 cmake -S . -B build
 cmake --build build --parallel
@@ -49,6 +51,46 @@ The version reported by `cclean --version` comes from `project(... VERSION ...)`
 
 Requires CMake 3.16 and a C++17 compiler. No dependencies beyond the standard library and pthreads. POSIX only: the confirmation prompt uses `<termios.h>`.
 
+## Library
+
+The program is a thin frontend over `libcclean`, which does the finding, sizing and removing. The library touches no terminal, prints nothing of its own, and reads no environment variable; argument parsing, the confirmation prompt, colour, progress and the human-readable report all live in `cli/`.
+
+```cpp
+#include <cclean/cclean.hpp>
+
+cclean::ScanOptions options;
+options.patterns = cclean::compile_patterns(true, {}, {"*.log"});
+options.excludes = cclean::compile_excludes({"vendor"});
+options.larger_than = 1024u * 1024;
+
+const cclean::ScanResult result = cclean::scan("./project", options);
+
+for (const cclean::Target& target : result.targets) {
+    std::string error;
+    cclean::remove_target(target, error);
+}
+```
+
+`scan()` walks the tree, sizes every matched directory, applies the age and size filters, and returns the targets sorted by path together with any paths it could not read. It takes an optional `ProgressFn`, called once per unit of work from the worker threads but serialised, so throttling is the caller's to decide.
+
+The headers, each usable on its own:
+
+| Header | Contents |
+|-|-|
+| `cclean/scan.hpp` | `ScanOptions`, `ScanResult`, `scan()`, `compile_patterns()`, `compile_excludes()` |
+| `cclean/target.hpp` | `Target` and the `Reason` it reports |
+| `cclean/remove.hpp` | `remove_target()`, the descriptor-relative deletion boundary |
+| `cclean/config.hpp` | `Config`, `find_config()`, `load_config()` |
+| `cclean/glob.hpp` | `Glob` and the two matching helpers |
+| `cclean/filters.hpp` | `parse_duration()`, `parse_size()`, `is_older_than()` |
+| `cclean/project.hpp` | Marker and repository detection for build artifacts and dependency trees |
+| `cclean/defaults.hpp` | The built-in pattern, artifact and skip tables |
+| `cclean/json.hpp` | `write_json()`, the machine-readable report |
+| `cclean/text.hpp` | Size formatting, terminal-safe display escaping, JSON string escaping |
+| `cclean/cclean.hpp` | All of the above, plus `version()` |
+
+The static library is `libcclean.a`. Everything is in namespace `cclean`. Link it with a threading library: a project that adds this one with `add_subdirectory` and links `cclean_core` gets `Threads::Threads` from the target, and one linking the installed archive needs `-pthread` itself. There is no installed CMake package config yet.
+
 ## Tests
 
 ```text
@@ -57,11 +99,13 @@ make test               # or: ctest --test-dir build --output-on-failure
 
 Two suites registered with CTest, neither with a dependency of its own:
 
-- `tests/unit.cpp` covers the glob matcher, size formatting, saturating addition, the skip list, pattern scope, and build-artifact detection. It includes `src/cclean.cpp` directly and renames its entry point, which is how it reaches static functions without splitting the program into a library.
+- `tests/unit.cpp` links `libcclean` and covers the glob matcher, the reasons a scan reports, size formatting, saturating addition, the skip list, pattern scope, build-artifact detection, the numeric filters, output escaping, and the worker pool. It also includes two headers under `src/`, which are part of the library but not of its installed API.
 
 - `tests/cli.sh` drives the built binary: exit codes, what is actually deleted, confirmation handling, the skip list end to end, build artifacts, symlinks, and the shape of the output.
 
-Both exit non-zero on failure, so `make test` fails the build. The terminal branch of the confirmation prompt, which takes a single keypress in raw mode, needs a pseudo-terminal and is not covered.
+Both exit non-zero on failure, so `make test` fails the build.
+
+The terminal branch of the confirmation prompt takes a single keypress in raw mode, so it is driven through a pseudo-terminal from `python3`, and is skipped where `python3` is absent. The driver reads the pty continuously rather than sleeping before it answers: `tcsetattr(TCSAFLUSH)` drains output first, which on a pty blocks until the master reads, and a keypress written during that window is queued and then discarded by the same call.
 
 ## Usage
 

@@ -1,19 +1,28 @@
-// Unit tests for the internals of cclean.
+// Unit tests for libcclean.
 //
-// cclean is a single translation unit with no header, so the tests include the
-// source directly and rename its entry point out of the way. That keeps the
-// program a single file while still reaching the static functions.
+// These link the library and use its public headers. Two headers under src/
+// are also reached directly: they are part of the library but not of its
+// installed API, and the behaviour they carry -- the TOML grammar and the
+// worker pool's exception handling -- is worth a test of its own.
 
 #include <atomic>
 #include <chrono>
 #include <cstdio>
-#include <stdexcept>
 #include <fstream>
+#include <limits>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
-#define main cclean_main
-#include "../src/cclean.cpp"
-#undef main
+#include <unistd.h>
+
+#include "cclean/cclean.hpp"
+
+#include "parallel.hpp"
+#include "toml.hpp"
+
+using namespace cclean;
+using namespace cclean::toml;
 
 namespace {
 
@@ -559,6 +568,90 @@ void test_artifact_detection() {
     CHECK(is_artifact_directory(submodule / "build", "build", tree.root()));
 }
 
+// ------------------------------------------------------------- scanning
+
+// The reason a target reports used to be worked out from the pattern's index
+// against two running counts, which every caller had to keep in step with the
+// order the patterns were built in. It is carried on the pattern itself now,
+// so the wiring is what this covers: the three sources, the scope each gets,
+// and the reasons that come back out of a real walk.
+void test_scan_reasons() {
+    group("scan reasons");
+
+    TempTree tree;
+    const fs::path root = tree.root();
+
+    fs::create_directories(root / "pkg" / "__pycache__");
+    std::ofstream(root / "pkg" / "__pycache__" / "a.bin") << "0123456789";
+    std::ofstream(root / "pkg" / "keep.py") << "x";
+    std::ofstream(root / "notes.log") << "xx";
+    std::ofstream(root / "scratch.tmp") << "xxx";
+
+    fs::create_directories(root / "vendor");
+    std::ofstream(root / "vendor" / "bundled.log") << "x";
+
+    ScanOptions options;
+    options.patterns = compile_patterns(true, {"*.tmp"}, {"*.log"});
+    options.excludes = compile_excludes({"vendor"});
+
+    const ScanResult result = scan(root, options);
+
+    CHECK(result.warnings.empty());
+    CHECK_EQ(result.targets.size(), 3u);
+
+    // Sorted by path, so the order is fixed rather than the walk's.
+    CHECK(std::is_sorted(result.targets.begin(), result.targets.end(),
+                         [](const Target& a, const Target& b) {
+                             return a.path < b.path;
+                         }));
+
+    const auto find = [&](const std::string& name) -> const Target* {
+        for (const Target& target : result.targets) {
+            if (target.path.filename() == name) {
+                return &target;
+            }
+        }
+        return nullptr;
+    };
+
+    const Target* cache = find("__pycache__");
+    const Target* log = find("notes.log");
+    const Target* tmp = find("scratch.tmp");
+
+    CHECK(cache != nullptr);
+    CHECK(log != nullptr);
+    CHECK(tmp != nullptr);
+
+    if (!cache || !log || !tmp) {
+        return;
+    }
+
+    CHECK_EQ(std::string(reason_name(cache->reason)), std::string("default"));
+    CHECK_EQ(std::string(reason_name(tmp->reason)), std::string("config"));
+    CHECK_EQ(std::string(reason_name(log->reason)),
+             std::string("command-line"));
+
+    // A matched directory is one target, sized from its contents, and is not
+    // descended into: keep.py sits beside it and is not a target of its own.
+    CHECK(cache->is_directory);
+    CHECK_EQ(cache->size, std::uintmax_t{10});
+    CHECK(find("a.bin") == nullptr);
+    CHECK(find("keep.py") == nullptr);
+
+    // An exclude prunes, so nothing under vendor/ is reachable at all.
+    CHECK(find("bundled.log") == nullptr);
+
+    // The size filter runs after sizing, so it sees the directory total.
+    ScanOptions large = options;
+    large.larger_than = std::uintmax_t{4};
+    CHECK_EQ(scan(root, large).targets.size(), 1u);
+
+    // Nothing in a tree made moments ago is a day old.
+    ScanOptions old = options;
+    old.older_than = std::chrono::hours(24);
+    CHECK_EQ(scan(root, old).targets.size(), 0u);
+}
+
 // ------------------------------------------------------ numeric parsing
 
 // The previous parser went through double and range-checked against
@@ -852,6 +945,7 @@ int main() {
     test_format_size();
     test_saturating_add();
     test_artifact_detection();
+    test_scan_reasons();
     test_parse_size();
     test_parse_duration();
     test_age_comparison();
