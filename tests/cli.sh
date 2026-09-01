@@ -709,6 +709,240 @@ check "command line pattern is added to the defaults" 4 \
 "$CCLEAN" -n --no-defaults "$d" "****a" >/dev/null 2>&1
 check "pathological pattern does not abort" 0 $?
 
+# --------------------------------------------------- numeric filter limits
+#
+# The limits used to be range-checked by comparing a double against
+# static_cast<double>(the integer maximum). Neither maximum is representable,
+# so the bound rounded up and a value written at the boundary passed the check
+# and then reached an out-of-range conversion. The limit came out as zero, so
+# --larger-than at the maximum matched every file instead of none.
+
+d=$WORK/limits
+rm -rf "$d"
+mkdir -p "$d"
+printf 'x' > "$d/one.pyc"
+
+check "--larger-than at the maximum matches nothing" 0 \
+      "$("$CCLEAN" -n --larger-than 18446744073709551615B "$d" | grep -c 'one.pyc')"
+check "--older-than at the maximum matches nothing" 0 \
+      "$("$CCLEAN" -n --older-than 9223372036854775807s "$d" | grep -c 'one.pyc')"
+
+"$CCLEAN" -n --larger-than 18446744073709551616B "$d" >/dev/null 2>&1
+check "--larger-than past the maximum is rejected" 2 $?
+"$CCLEAN" -n --older-than 9223372036854775808s "$d" >/dev/null 2>&1
+check "--older-than past the maximum is rejected" 2 $?
+"$CCLEAN" -n --larger-than 16777216T "$d" >/dev/null 2>&1
+check "--larger-than overflowing through its unit is rejected" 2 $?
+
+check "--larger-than 0B matches" 1 \
+      "$("$CCLEAN" -n --larger-than 0B "$d" | grep -c 'one.pyc')"
+check "--larger-than 1B matches a one byte file" 1 \
+      "$("$CCLEAN" -n --larger-than 1B "$d" | grep -c 'one.pyc')"
+check "--larger-than 2B does not" 0 \
+      "$("$CCLEAN" -n --larger-than 2B "$d" | grep -c 'one.pyc')"
+
+printf '%2048s' '' > "$d/two.pyc"
+check "fractional size is exact" 1 \
+      "$("$CCLEAN" -n --larger-than 1.5K "$d" | grep -c 'two.pyc')"
+check "fractional size rounds toward zero, not up" 0 \
+      "$("$CCLEAN" -n --larger-than 2.5K "$d" | grep -c 'two.pyc')"
+
+for bad in 1e3d -1d .d 1.2.3d; do
+    "$CCLEAN" -n --older-than "$bad" "$d" >/dev/null 2>&1
+    check "--older-than $bad is rejected" 2 $?
+done
+
+# ------------------------------------------------------------ marker types
+#
+# The marker guard used exists(), which follows symlinks and is satisfied by a
+# directory or a FIFO. A build directory could then be removed beside a marker
+# that was not the project file it claimed to be.
+
+marker_fixture() {
+    d=$WORK/marker-$1
+    rm -rf "$d"
+    mkdir -p "$d/proj/build"
+    printf 'x' > "$d/proj/build/out"
+    echo "$d"
+}
+
+d=$(marker_fixture regular)
+mkdir "$d/proj/.git"
+printf 'x' > "$d/proj/CMakeLists.txt"
+check "a regular marker file matches" 1 \
+      "$("$CCLEAN" -b -n "$d" | grep -c 'build')"
+
+d=$(marker_fixture directory)
+mkdir "$d/proj/.git" "$d/proj/CMakeLists.txt"
+check "a directory named like the marker does not" 0 \
+      "$("$CCLEAN" -b -n "$d" | grep -c 'build')"
+
+d=$(marker_fixture symlink)
+mkdir "$d/proj/.git"
+printf 'x' > "$d/outside"
+ln -s "$d/outside" "$d/proj/CMakeLists.txt"
+check "a symlinked marker does not" 0 \
+      "$("$CCLEAN" -b -n "$d" | grep -c 'build')"
+
+d=$(marker_fixture broken)
+mkdir "$d/proj/.git"
+ln -s "$d/nowhere" "$d/proj/CMakeLists.txt"
+check "a broken symlink marker does not" 0 \
+      "$("$CCLEAN" -b -n "$d" | grep -c 'build')"
+
+# A submodule or a linked worktree carries a .git file rather than a
+# directory, and both name a real repository.
+d=$(marker_fixture gitfile)
+printf 'gitdir: ../.git/modules/proj\n' > "$d/proj/.git"
+printf 'x' > "$d/proj/CMakeLists.txt"
+check "a .git file counts as a repository" 1 \
+      "$("$CCLEAN" -b -n "$d" | grep -c 'build')"
+
+d=$(marker_fixture gitlink)
+ln -s "$d/elsewhere" "$d/proj/.git"
+printf 'x' > "$d/proj/CMakeLists.txt"
+check "a symlinked .git does not" 0 \
+      "$("$CCLEAN" -b -n "$d" | grep -c 'build')"
+
+if command -v mkfifo >/dev/null 2>&1; then
+    d=$(marker_fixture fifo)
+    mkdir "$d/proj/.git"
+    mkfifo "$d/proj/CMakeLists.txt"
+    check "a FIFO named like the marker does not" 0 \
+          "$("$CCLEAN" -b -n "$d" | grep -c 'build')"
+fi
+
+# ------------------------------------------------------- symlink timestamps
+#
+# The scan treats a symlink as the object, never its target: it is reported at
+# zero bytes and is not descended into. The age filter has to agree, or a link
+# is judged by a file that can sit outside the tree entirely.
+
+d=$WORK/linktime
+rm -rf "$d"
+mkdir -p "$d"
+printf 'x' > "$d/fresh.txt"
+ln -s fresh.txt "$d/old.pyc"
+touch -h -d '2001-01-01' "$d/old.pyc"
+check "an old link to a fresh file is old" 1 \
+      "$("$CCLEAN" -n --older-than 1d "$d" | grep -c 'old.pyc')"
+
+ln -s fresh.txt "$d/new.pyc"
+check "a fresh link is not old" 0 \
+      "$("$CCLEAN" -n --older-than 1d "$d" | grep -c 'new.pyc')"
+
+# ------------------------------------------------------------ hostile names
+#
+# The matched list is what the user reads before confirming a permanent
+# deletion, so a name cannot be allowed to forge a line in it or erase one.
+
+d=$WORK/names
+rm -rf "$d"
+mkdir -p "$d"
+touch "$d/$(printf 'two\nlines').pyc"
+touch "$d/$(printf 'esc\033[2Kwipe').pyc"
+touch "$d/$(printf 'ret\ril').pyc"
+
+check "a newline in a name is escaped" 0 \
+      "$("$CCLEAN" -n "$d" | grep -c '^lines.pyc')"
+check "an escape character never reaches the terminal" 0 \
+      "$(NO_COLOR=1 "$CCLEAN" -n "$d" | grep -c "$(printf '\033')")"
+check "a carriage return never reaches the terminal" 0 \
+      "$(NO_COLOR=1 "$CCLEAN" -n "$d" | grep -c "$(printf '\r')")"
+check "the escaped names are still all listed" 3 \
+      "$("$CCLEAN" -n "$d" | grep -c '\.pyc')"
+
+# JSON is defined over text, so one undecodable byte in one name used to make
+# the whole document unparseable, totals and warnings included.
+if command -v python3 >/dev/null 2>&1; then
+    touch "$d/$(printf 'bad\377').pyc"
+    "$CCLEAN" -n --format json "$d" 2>/dev/null > "$WORK/names.json"
+    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$WORK/names.json" \
+        >/dev/null 2>&1
+    check "json output stays decodable next to an invalid name" 0 $?
+fi
+
+# -------------------------------------------------------------- config form
+#
+# The array parser skipped every comma before the next value, so a typo that
+# changed what a committed configuration deleted was accepted in silence.
+
+config_run() {
+    d=$WORK/cfgform
+    rm -rf "$d"
+    mkdir -p "$d"
+    printf 'x' > "$d/f.tmp"
+    printf '%s\n' "$1" > "$d/.cclean.toml"
+    "$CCLEAN" -n "$d" >/dev/null 2>&1
+    echo $?
+}
+
+check "a leading comma is rejected" 2 "$(config_run 'patterns = [, "*.tmp"]')"
+check "a repeated comma is rejected" 2 "$(config_run 'patterns = ["*.a",,"*.tmp"]')"
+check "a missing comma is rejected" 2 "$(config_run 'patterns = ["*.a" "*.tmp"]')"
+check "a trailing comma is allowed" 0 "$(config_run 'patterns = ["*.tmp",]')"
+check "an empty array is allowed" 0 "$(config_run 'patterns = []')"
+check "a duplicate key is rejected" 2 \
+      "$(config_run 'patterns = ["*.a"]
+patterns = ["*.tmp"]')"
+check "a pair array without a separator is rejected" 2 \
+      "$(config_run 'dependency_markers = [["a","b"] ["c","d"]]')"
+# The outer parser used to stop at the first ], inside a string or not.
+check "a marker name containing a bracket is accepted" 0 \
+      "$(config_run 'dependency_markers = [["vendor", "we]ird.lock"]]')"
+
+# --------------------------------------------------------- terminal prompt
+#
+# The confirmation puts the terminal into raw mode to take a single keypress
+# and restores it afterwards. That branch needs a pseudo-terminal, so it is
+# driven through python3 where one is available.
+
+if command -v python3 >/dev/null 2>&1; then
+    pty_answer() {
+        python3 - "$CCLEAN" "$1" "$2" <<'PTY_DRIVER'
+import os, pty, sys, time
+
+command, root, answer = sys.argv[1], sys.argv[2], sys.argv[3]
+pid, fd = pty.fork()
+
+if pid == 0:
+    os.execv(command, ["cclean", root])
+
+time.sleep(0.3)
+os.write(fd, answer.encode())
+
+output = b""
+try:
+    while True:
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            break
+        output += chunk
+except OSError:
+    pass
+
+os.waitpid(pid, 0)
+sys.stdout.write(output.decode("utf-8", "replace"))
+PTY_DRIVER
+    }
+
+    d=$(fixture ptyno)
+    before=$(count_files "$d")
+    pty_answer "$d" n >/dev/null 2>&1
+    check "a keypress other than y cancels at a terminal" "$before" \
+          "$(count_files "$d")"
+
+    d=$(fixture ptyyes)
+    pty_answer "$d" y >/dev/null 2>&1
+    check "y at a terminal removes without Enter" 2 "$(count_files "$d")"
+
+    # The answer is a single keypress, so the terminal is in raw no-echo mode
+    # when it arrives and has to be put back before the run returns.
+    d=$(fixture ptyecho)
+    check "the run completes through a terminal" 1 \
+          "$(pty_answer "$d" y 2>/dev/null | grep -c 'Removed')"
+fi
+
 # ------------------------------------------------------------------ result
 
 if [ "$failed" -eq 0 ]; then

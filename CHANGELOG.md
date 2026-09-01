@@ -2,6 +2,50 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- A CI workflow: GCC and Clang on Linux and Clang on macOS, both suites under AddressSanitizer with UndefinedBehaviorSanitizer and under ThreadSanitizer, and a run as an unprivileged user so the permission tests are not silently no-ops under root.
+
+- Regression coverage for everything below: numeric limits at zero, at the maximum, and one past it; marker directories, FIFOs, symlinks, broken symlinks, and `.git` as a file; symlink timestamps; filenames containing newlines, escape sequences, and invalid UTF-8; malformed and duplicated configuration keys; and the terminal confirmation branch, driven through a pseudo-terminal. The suites go from 178 to 293 unit checks and from 136 to 175 command-line checks.
+
+### Changed
+
+- The configuration parser rejects duplicate keys and empty array elements. Values were appended, so a key repeated by a bad merge widened what a run deleted, and every comma before the next value was skipped, so `patterns = [, "*.tmp"]` and `["*.a",,,"*.b"]` both parsed. A single trailing comma is still accepted, as TOML accepts it. Nested arrays are parsed structurally rather than by searching for the next `]`, so a marker name containing that character is no longer rejected.
+
+- The worker pool is capped at 32 threads, and a thread that cannot be created is no longer fatal. The pool was sized one per core, so a many-core host made 127 threads for a scan with work for a handful. Growing the pool to match the work instead, which is the obvious answer, was implemented, measured, and rejected: in every form tried it cost 6 to 8 percent of a scan of a real tree, because the state the growth step needs stays live across a very tight loop. The reasoning is recorded beside the code so it is not retried blind.
+
+- Performance is unchanged on scanning and startup, and 2 to 3 percent slower on deletion. Scans measured within noise of the previous release over a 32,000-entry tree (+1.8% sizing-heavy, -3.6% full walk, +2.2% every file matched). Deletion pays 2 to 3 percent for resolving each level through a descriptor instead of a path, which is what closes the race above; the unlink is attempted before anything is known about an entry, so the common case costs one syscall where a stat first cost two.
+
+- A target whose parent cannot be opened, or whose own status cannot be read, reports the underlying error. Every failure at that point previously read `Target changed or disappeared`, which is now reserved for the case where it actually did.
+
+- The README states the contracts these changes settle: the accepted configuration subset rather than an implication of full TOML, how filenames are escaped in each output format, that a symlink is filtered on its own timestamp, and how deletion resolves a path.
+
+### Fixed
+
+- `--older-than` and `--larger-than` no longer perform an out-of-range floating-point conversion. Both parsed through `double` and range-checked against `static_cast<double>` of the integer maximum; neither maximum is representable, so the bound rounded up to the next power of two, and a value written at the boundary passed the check and then reached a conversion that is undefined in C++. In practice the limit came out as zero, so `--larger-than 18446744073709551615B` matched every file instead of none, which is the opposite of what a filter used as a safety boundary before deletion is for. Both are now converted exactly, as fixed-point decimals truncated toward zero, and a value that does not fit is rejected. An exponent, a sign, or any trailing character is likewise an error rather than a silently different limit.
+
+- The age comparison no longer overflows. `now - limit` is not representable on a clock counting nanoseconds in 64 bits once the limit is measured in centuries; the comparison is made in whole seconds and saturates.
+
+- `--older-than` judges a symlink by the link's own timestamp rather than its target's. The scan treats a symlink as the object throughout, reporting it at zero bytes and never descending into it, but the timestamp query resolved the link: a link whose own mtime was years old was kept out of the list because the file it pointed at, possibly outside the scanned tree entirely, had been touched today.
+
+- Failed filesystem status queries are reported instead of being read as "not a directory" or "not a regular file". A permission error, or an entry disappearing mid-walk, could drop a whole subtree from a directory's size in silence, or carry a target forward on an incomplete assessment, against the documented behaviour that an unreadable path is named and the run exits 1.
+
+- JSON output is always valid UTF-8. A POSIX filename need not be, and the bytes were copied through unchanged, so one undecodable byte in one name made the entire document unparseable, totals and warnings included. Invalid bytes become U+FFFD, one per byte, so a `path` may be a lossy rendering of the real name; the human output remains the faithful form.
+
+- Removal failures appear in the JSON `warnings` array. Only pre-delete validation failures were recorded there; an error from the removal itself went to standard error alone and left no trace in the document.
+
+- A failed terminal restoration is reported rather than ignored, and restoration happens on every path out of the prompt, the destructor included. Both `tcsetattr()` results were discarded, and a terminal left in raw no-echo mode is invisible until the user types the next command and sees nothing back.
+
+### Security
+
+- Deletion is descriptor-relative and never follows a symlink below `ROOT`. Validation checked a path and the removal then re-resolved the same path, and `remove_all()` re-resolved every component at every level of the subtree, so a concurrent process could put a different object of the same type at a reviewed path between the two lookups. The target's parent is now opened once and the type check runs against that descriptor; each level below is opened with `O_NOFOLLOW` and its entries unlinked within it, so a component swapped after the check cannot be reached by name and a symlink substituted for a directory is an error rather than a way out of the tree. The parent itself is still opened by path, because `ROOT` may legitimately have been reached through a symlink and the user named it.
+
+- Marker guards require a regular file. `exists()` follows symlinks and is satisfied by a directory or a FIFO, so a directory named `CMakeLists.txt`, or a symlink pointing at an unrelated file elsewhere, could license the removal of a build directory in a tree holding none of the project metadata the guard exists to prove. `.git` still accepts a directory or a file, since a working tree carries the former and a submodule or linked worktree the latter, but no longer a symlink.
+
+- Control characters in filenames are escaped in human output. The matched list is what the user reads before confirming a permanent deletion: a name containing a newline could forge an entry in it, and one containing a terminal escape sequence could erase an entry already printed. Every C0 control and DEL is shown as `\xNN`, and a literal backslash is doubled so the escape is unambiguous.
+
 ## [0.2.0]
 
 ### Added

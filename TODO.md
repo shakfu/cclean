@@ -20,10 +20,14 @@
 
 - [x] **Unreadable directories are reported**: permission failures become warnings and return status 1.
 
-- [x] **Pre-delete validation**: targets are rechecked before removal so a changed or replaced path is rejected.
+- [x] **Atomic pre-delete validation**: the parent directory is opened once, the type check runs against that descriptor, and every removal names an entry within a directory descriptor opened `O_NOFOLLOW`, so a path re-resolved between the check and the removal can no longer point somewhere else.
 
 - [ ] **`ROOT` is exempt from the protected list**: pointing cclean at `.git` scans it. Deliberate, in that naming a directory is explicit, but inconsistent with the same name being protected during a walk.
 
 ## Tests
 
-- [ ] **Terminal confirmation is untested**: the branch that puts the terminal in raw mode for a single keypress and restores it afterwards needs a pseudo-terminal. `script` can provide one, but its arguments differ between macOS and Linux. The piped branch is covered.
+- [x] **Terminal confirmation is tested**: the raw-mode branch is driven through a pseudo-terminal from `python3`, which behaves the same on macOS and Linux where `script` does not. The checks are skipped when `python3` is absent.
+
+- [ ] **Fuzzing**: the configuration parser, the glob compiler and the numeric filter parsers all take untrusted text and none has a fuzz target. The malformed-input cases in the suites are hand-written, so they cover the shapes that were already known to be wrong.
+
+- [ ] **Deletion races are not tested**: the removal path is descriptor-relative and no-follow, but nothing in the suites actually competes with it. Proving the property needs a second process renaming components mid-run, which is inherently timing-dependent.

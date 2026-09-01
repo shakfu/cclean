@@ -101,7 +101,7 @@ cclean --no-defaults . "build/**"         # only what is named here
 
 cclean searches from `ROOT` upward for the first `.cclean.toml`. It does not read configuration from outside that ancestor chain. CLI options override configuration values. CLI exclude patterns replace configured excludes when at least one `--exclude` is supplied; command-line patterns are added after configured patterns.
 
-The supported schema is deliberately small and rejects unknown keys or invalid values:
+The supported schema is deliberately small and rejects unknown keys, duplicate keys, and invalid values:
 
 ```toml
 patterns = ["*.tmp", "**/generated/**"]
@@ -117,6 +117,8 @@ larger_than = "100M"
 ```
 
 `patterns`, `excludes`, and `project_roots` are arrays of strings; `dependency_markers` is an array of two-string arrays. The other values are booleans or quoted filter values. Configuration errors exit with status 2 before scanning starts.
+
+The file is read by a small hand-written parser, not a TOML library, and it accepts a subset of TOML rather than all of it: one `key = value` per line, no tables, no multi-line arrays, and basic strings with no backslash escapes. Within that subset it is strict — a key may appear only once, an array element may not be empty (`[, "a"]` and `["a",,"b"]` are errors), a single trailing comma is allowed, and anything it does not understand is an error rather than a value quietly ignored. A `#` outside quotes starts a comment.
 
 `dependency_markers` adds ecosystems the built-in list leaves out. Each entry is a directory name and the marker file that must sit beside it, both plain names rather than paths, since the marker is looked up in the directory's parent. A configured pair takes the same marker guard and the same `--dependencies` gate as a built-in, which is what distinguishes it from a pattern: `patterns = ["deps"]` matches any directory of that name, on every run.
 
@@ -240,6 +242,14 @@ The matched list is printed once. After confirmation you get a one-line summary;
 
 `--format json` writes one JSON document to standard output. It includes the root, status, matched targets, logical byte totals, per-reason statistics, and warnings. Progress, prompts, and other diagnostics go to standard error. Each target includes a `reason`: `default`, `config`, `command-line`, `build-artifact`, or `dependency`.
 
+### Filenames in output
+
+A POSIX filename is a byte string: it can contain control characters, and it need not be valid UTF-8. Both forms of output account for that, differently.
+
+In human output, every C0 control character and DEL is shown as `\xNN` and a literal backslash is doubled. This is what stops a name containing a newline from forging an entry in the matched list, or one containing an escape sequence from erasing an entry already printed — the list is what you read before confirming a permanent deletion. Bytes above `0x7f` are passed through, so ordinary non-ASCII names display normally.
+
+In JSON output, the document is always valid UTF-8 and always parseable. Bytes that are not valid UTF-8 are replaced with U+FFFD, one per byte, so a `path` may be a lossy rendering of the real name; the human output is the faithful form. Control characters are `\u`-escaped as JSON requires.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -252,14 +262,24 @@ The matched list is printed once. After confirmation you get a one-line summary;
 
 Reported sizes are logical file sizes, not disk usage. They ignore block rounding, sparse files, and filesystem compression, so the space actually reclaimed may differ.
 
-`--older-than` drops targets younger than the duration. Durations use `s`, `m`, `h`, `d`, or `w`. For directories, the newest entry in the directory determines its age. `--larger-than` keeps only targets at or above the given logical size. Sizes use bytes by default, or binary `K`, `M`, `G`, or `T` suffixes.
+`--older-than` drops targets younger than the duration. Durations use `s`, `m`, `h`, `d`, or `w`. For directories, the newest entry in the directory determines its age. For a symlink, the link's own timestamp is used, never its target's — the same no-follow rule the rest of the scan applies. `--larger-than` keeps only targets at or above the given logical size. Sizes use bytes by default, or binary `K`, `M`, `G`, or `T` suffixes.
+
+Both filters accept a decimal value with an optional fractional part, converted exactly and truncated toward zero. A value that does not fit, or that carries an exponent, a sign, or any trailing character, is an error rather than a silently different limit.
 
 Directories are sized in parallel across all cores. The unit of work is a single directory level rather than a whole target, so one large `node_modules` parallelizes as well as a thousand small `__pycache__` directories.
 
 The tree walk uses the same work queue, so listing directories is spread across cores too. On a 65,101-entry tree that took the walk from 102 ms to 49 ms, and a full dry run from 88 ms to 61 ms, on 8 cores.
 
+## How deletion works
+
+Removal is descriptor-relative. The parent directory of a reviewed target is opened once, the entry is confirmed to still have the type it had when the list was shown, and every removal names an entry within a directory descriptor rather than re-resolving a path. Directories are emptied by opening each level with `O_NOFOLLOW` and unlinking within it, so a symlink substituted for a directory mid-run is an error rather than a way out of the tree, and a component renamed after the check cannot be reached by name at all.
+
+Symlinks are unlinked, never followed. A symlink matched as a target removes the link itself and leaves whatever it pointed at alone.
+
 ## Limitations
 
 - Unreadable directories are reported as warnings and make the command exit with status 1. The root itself must be readable.
+
+- A removal that is already in progress cannot be undone by a change made underneath it. The identity check happens once, before the walk down a matched directory begins; entries created inside that directory while it is being emptied are removed along with the rest.
 
 - Pointing `ROOT` directly at a protected directory scans it. The skip list applies to entries found during the walk, not to `ROOT` itself.

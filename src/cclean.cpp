@@ -12,6 +12,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <set>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -19,6 +20,12 @@
 #include <thread>
 #include <vector>
 
+#include <cerrno>
+#include <cstring>
+
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -178,6 +185,69 @@ static bool parse_bool(const std::string& value, bool& result) {
     return false;
 }
 
+static void skip_blanks(const std::string& text, std::size_t& position) {
+    while (position < text.size() &&
+           (text[position] == ' ' || text[position] == '\t')) {
+        ++position;
+    }
+}
+
+// One comma between elements, no more and none before the first. TOML has no
+// empty array element, and skipping every comma before the next value made
+// [, "*.tmp"] and ["*.a",,, "*.b"] both parse: a typo in a committed config
+// silently changed what a run would delete instead of being rejected. A single
+// trailing comma is allowed, as TOML allows it.
+static bool parse_separator(
+    const std::string& body,
+    std::size_t& position,
+    bool& more)
+{
+    skip_blanks(body, position);
+
+    if (position == body.size()) {
+        more = false;
+        return true;
+    }
+
+    if (body[position] != ',') {
+        return false;
+    }
+
+    ++position;
+    skip_blanks(body, position);
+    more = position != body.size();
+    return true;
+}
+
+static bool parse_quoted(
+    const std::string& body,
+    std::size_t& position,
+    std::string& item)
+{
+    if (position >= body.size() || body[position] != '"') {
+        return false;
+    }
+
+    ++position;
+    item.clear();
+
+    while (position < body.size()) {
+        const char c = body[position++];
+
+        if (c == '"') {
+            return true;
+        }
+
+        if (c == '\\' || c == '\n' || c == '\r') {
+            return false;
+        }
+
+        item += c;
+    }
+
+    return false;
+}
+
 static bool parse_string_array(
     const std::string& value,
     std::vector<std::string>& result)
@@ -191,52 +261,66 @@ static bool parse_string_array(
     const std::string body = text.substr(1, text.size() - 2);
     std::size_t position = 0;
 
-    while (position < body.size()) {
-        while (position < body.size() &&
-               (body[position] == ' ' || body[position] == '\t' ||
-                body[position] == ',')) {
-            ++position;
-        }
+    skip_blanks(body, position);
+    bool more = position != body.size();
 
-        if (position == body.size()) {
-            break;
-        }
-
-        if (body[position] != '"') {
-            return false;
-        }
-        ++position;
-
+    while (more) {
         std::string item;
-        bool closed = false;
-        while (position < body.size()) {
-            const char c = body[position++];
-            if (c == '"') {
-                closed = true;
-                break;
-            }
-            if (c == '\\' || c == '\n' || c == '\r') {
-                return false;
-            }
-            item += c;
-        }
 
-        if (!closed) {
+        if (!parse_quoted(body, position, item)) {
             return false;
         }
 
         result.push_back(std::move(item));
 
-        while (position < body.size() &&
-               (body[position] == ' ' || body[position] == '\t')) {
-            ++position;
-        }
-        if (position < body.size() && body[position] != ',') {
+        if (!parse_separator(body, position, more)) {
             return false;
         }
     }
 
     return true;
+}
+
+// Index of the ']' closing the '[' at `position`, or npos. Scanning for the
+// next ']' textually instead rejected a perfectly ordinary POSIX marker name
+// containing that character, because the search did not know it was inside a
+// string. Quotes and nesting are both tracked here; the string bodies
+// themselves are still parsed by parse_quoted.
+static std::size_t find_array_end(
+    const std::string& body,
+    std::size_t position)
+{
+    std::size_t depth = 0;
+    bool quoted = false;
+
+    for (; position < body.size(); ++position) {
+        const char c = body[position];
+
+        if (quoted) {
+            if (c == '\\') {
+                // Escapes are rejected by parse_quoted, so a backslash cannot
+                // be hiding a quote; treating it as ordinary keeps the two
+                // scanners agreeing on where the string ends.
+                continue;
+            }
+            if (c == '"') {
+                quoted = false;
+            }
+            continue;
+        }
+
+        if (c == '"') {
+            quoted = true;
+        } else if (c == '[') {
+            ++depth;
+        } else if (c == ']') {
+            if (--depth == 0) {
+                return position;
+            }
+        }
+    }
+
+    return std::string::npos;
 }
 
 // [["deps", "mix.exs"], ["vendor", "composer.lock"]]. The inner arrays go
@@ -255,27 +339,22 @@ static bool parse_pair_array(
     const std::string body = text.substr(1, text.size() - 2);
     std::size_t position = 0;
 
-    while (position < body.size()) {
-        while (position < body.size() &&
-               (body[position] == ' ' || body[position] == '\t' ||
-                body[position] == ',')) {
-            ++position;
-        }
+    skip_blanks(body, position);
+    bool more = position != body.size();
 
-        if (position == body.size()) {
-            break;
-        }
-
+    while (more) {
         if (body[position] != '[') {
             return false;
         }
 
-        const std::size_t close = body.find(']', position);
+        const std::size_t close = find_array_end(body, position);
+
         if (close == std::string::npos) {
             return false;
         }
 
         std::vector<std::string> pair;
+
         if (!parse_string_array(body.substr(position, close - position + 1),
                                 pair) ||
             pair.size() != 2) {
@@ -294,11 +373,7 @@ static bool parse_pair_array(
         result.emplace_back(pair[0], pair[1]);
         position = close + 1;
 
-        while (position < body.size() &&
-               (body[position] == ' ' || body[position] == '\t')) {
-            ++position;
-        }
-        if (position < body.size() && body[position] != ',') {
+        if (!parse_separator(body, position, more)) {
             return false;
         }
     }
@@ -330,6 +405,7 @@ static bool load_config(
 
     std::string line;
     std::size_t line_number = 0;
+    std::set<std::string> seen_keys;
     while (std::getline(input, line)) {
         ++line_number;
         // Only a # outside quotes opens a comment. Truncating at the first one
@@ -360,6 +436,16 @@ static bool load_config(
 
         const std::string key = trim(line.substr(0, equals));
         const std::string value = trim(line.substr(equals + 1));
+
+        // Every key here is a scalar or a whole array, so a second one is
+        // always a mistake. Without this the values were quietly appended,
+        // and a key repeated by a bad merge widened what a run deleted with
+        // nothing to show for it. TOML rejects a duplicate key outright.
+        if (!seen_keys.insert(key).second) {
+            error = path.string() + ":" + std::to_string(line_number) +
+                    ": duplicate key " + key;
+            return false;
+        }
 
         if (key == "patterns") {
             if (!parse_string_array(value, config.patterns)) {
@@ -454,69 +540,182 @@ static fs::path find_config(const fs::path& root) {
     return {};
 }
 
+// Exact fixed-point conversion of a non-negative decimal, scaled by
+// `multiplier` and truncated toward zero. Going through `double` and then
+// range-checking against static_cast<double>(max) does not work: neither
+// INT64_MAX nor UINTMAX_MAX is representable, so the bound rounds up to 2^63
+// and 2^64 and a value written at the boundary passed the check only to reach
+// an out-of-range floating-to-integer conversion, which is undefined. That
+// turned --larger-than 18446744073709551615B into a limit of zero, which
+// matched every file instead of none -- the opposite of what a filter used as
+// a safety boundary before deletion is for.
+static bool parse_scaled(
+    const std::string& text,
+    std::uintmax_t multiplier,
+    std::uintmax_t limit,
+    std::uintmax_t& result)
+{
+    // Past nine fractional digits neither a byte count nor a second count can
+    // still differ. The rest are still validated, then dropped.
+    constexpr int max_fraction_digits = 9;
+
+    std::size_t position = 0;
+    std::uintmax_t whole = 0;
+    bool any_digit = false;
+    bool overflow = false;
+
+    for (; position < text.size() &&
+           text[position] >= '0' && text[position] <= '9'; ++position) {
+        any_digit = true;
+        const auto digit = static_cast<std::uintmax_t>(text[position] - '0');
+        if (whole > (limit - digit) / 10) {
+            overflow = true;
+        } else {
+            whole = whole * 10 + digit;
+        }
+    }
+
+    std::uintmax_t fraction = 0;
+    std::uintmax_t denominator = 1;
+
+    if (position < text.size() && text[position] == '.') {
+        ++position;
+        int used = 0;
+        for (; position < text.size() &&
+               text[position] >= '0' && text[position] <= '9'; ++position) {
+            any_digit = true;
+            if (used < max_fraction_digits) {
+                fraction = fraction * 10 +
+                           static_cast<std::uintmax_t>(text[position] - '0');
+                denominator *= 10;
+                ++used;
+            }
+        }
+    }
+
+    // A bare ".", a sign, an exponent, or any trailing character is a
+    // rejection: the units are the only suffix the grammar allows.
+    if (!any_digit || position != text.size() || overflow || multiplier == 0) {
+        return false;
+    }
+
+    if (whole > limit / multiplier) {
+        return false;
+    }
+
+    const std::uintmax_t value = whole * multiplier;
+
+    // fraction < denominator <= 1e9 and remainder < denominator, so the second
+    // product stays under 1e18 and cannot overflow. The first is checked.
+    const std::uintmax_t quotient = multiplier / denominator;
+    const std::uintmax_t remainder = multiplier % denominator;
+
+    if (quotient != 0 && fraction > limit / quotient) {
+        return false;
+    }
+
+    std::uintmax_t extra = fraction * quotient;
+    const std::uintmax_t rest = (fraction * remainder) / denominator;
+
+    if (rest > limit - extra || extra + rest > limit - value) {
+        return false;
+    }
+
+    result = value + extra + rest;
+    return true;
+}
+
 static std::optional<std::chrono::seconds> parse_duration(
     const std::string& value)
 {
     if (value.size() < 2) {
         return std::nullopt;
     }
-    const char suffix = value.back();
-    char* end = nullptr;
-    const double number = std::strtod(value.c_str(), &end);
-    // The suffix has to be the only thing left, or "1dd" and "1d5d" both read
-    // as one day: comparing *end to the last character alone cannot tell them
-    // from "1d".
-    const bool consumed = end == value.c_str() + value.size() - 1;
-    if (end != value.c_str() && consumed && number >= 0) {
-        double multiplier = 0;
-        switch (suffix) {
-        case 's': multiplier = 1; break;
-        case 'm': multiplier = 60; break;
-        case 'h': multiplier = 60 * 60; break;
-        case 'd': multiplier = 24 * 60 * 60; break;
-        case 'w': multiplier = 7 * 24 * 60 * 60; break;
-        default: return std::nullopt;
-        }
-        const double seconds = number * multiplier;
-        if (seconds <= static_cast<double>(std::numeric_limits<std::int64_t>::max())) {
-            return std::chrono::seconds(static_cast<std::int64_t>(seconds));
-        }
+
+    std::uintmax_t multiplier = 0;
+
+    switch (value.back()) {
+    case 's': multiplier = 1; break;
+    case 'm': multiplier = 60; break;
+    case 'h': multiplier = 60 * 60; break;
+    case 'd': multiplier = 24 * 60 * 60; break;
+    case 'w': multiplier = 7 * 24 * 60 * 60; break;
+    default: return std::nullopt;
     }
-    return std::nullopt;
+
+    // The unit has to be the only thing left, or "1dd" and "1d5d" both read as
+    // one day. parse_scaled rejects the leftover letter for us.
+    std::uintmax_t seconds = 0;
+    const auto limit =
+        static_cast<std::uintmax_t>(std::numeric_limits<std::int64_t>::max());
+
+    if (!parse_scaled(value.substr(0, value.size() - 1),
+                      multiplier, limit, seconds)) {
+        return std::nullopt;
+    }
+
+    return std::chrono::seconds(static_cast<std::int64_t>(seconds));
 }
 
 static std::optional<std::uintmax_t> parse_size(const std::string& value) {
     if (value.empty()) {
         return std::nullopt;
     }
+
     std::size_t split = 0;
     while (split < value.size() &&
            ((value[split] >= '0' && value[split] <= '9') ||
             value[split] == '.')) {
         ++split;
     }
-    if (split == 0) {
-        return std::nullopt;
-    }
-    const std::string number_text = value.substr(0, split);
-    char* end = nullptr;
-    const double number = std::strtod(number_text.c_str(), &end);
-    if (end == number_text.c_str() || *end != '\0') {
-        return std::nullopt;
-    }
+
     const std::string suffix = value.substr(split);
-    double multiplier = 1;
+    std::uintmax_t multiplier = 1;
+
     if (suffix == "B" || suffix.empty()) multiplier = 1;
     else if (suffix == "K" || suffix == "KiB") multiplier = 1024;
-    else if (suffix == "M" || suffix == "MiB") multiplier = 1024 * 1024;
-    else if (suffix == "G" || suffix == "GiB") multiplier = 1024 * 1024 * 1024;
-    else if (suffix == "T" || suffix == "TiB") multiplier = 1024.0 * 1024 * 1024 * 1024;
+    else if (suffix == "M" || suffix == "MiB") multiplier = 1024ULL * 1024;
+    else if (suffix == "G" || suffix == "GiB") multiplier = 1024ULL * 1024 * 1024;
+    else if (suffix == "T" || suffix == "TiB") multiplier = 1024ULL * 1024 * 1024 * 1024;
     else return std::nullopt;
-    const double bytes = number * multiplier;
-    if (number < 0 || bytes > static_cast<double>(std::numeric_limits<std::uintmax_t>::max())) {
+
+    std::uintmax_t bytes = 0;
+
+    if (!parse_scaled(value.substr(0, split), multiplier,
+                      std::numeric_limits<std::uintmax_t>::max(), bytes)) {
         return std::nullopt;
     }
-    return static_cast<std::uintmax_t>(bytes);
+
+    return bytes;
+}
+
+// now - limit is not safe to compute for a large --older-than: the filesystem
+// clock counts nanoseconds in 64 bits, so subtracting a duration measured in
+// centuries from it overflows. Both sides are reduced to whole seconds since
+// the clock's own epoch instead, and the subtraction saturates.
+static bool is_older_than(
+    fs::file_time_type when,
+    fs::file_time_type now,
+    std::chrono::seconds limit)
+{
+    const auto to_seconds = [](fs::file_time_type point) {
+        return std::chrono::duration_cast<std::chrono::seconds>(
+                   point.time_since_epoch()).count();
+    };
+
+    const std::int64_t when_seconds = to_seconds(when);
+    const std::int64_t now_seconds = to_seconds(now);
+    const std::int64_t limit_seconds = limit.count();
+
+    // The cutoff can only fall below the representable range when the clock
+    // epoch is itself in the future, and then nothing is old enough.
+    if (now_seconds < 0 &&
+        limit_seconds >
+            now_seconds - std::numeric_limits<std::int64_t>::min()) {
+        return false;
+    }
+
+    return when_seconds <= now_seconds - limit_seconds;
 }
 
 // A glob compiled to tokens. std::regex dominated the scan: on a 64k-entry
@@ -845,6 +1044,71 @@ private:
     }
 };
 
+// Restores the terminal on every path out, the destructor included, so an
+// exception or a return added later cannot leave it in raw no-echo mode. That
+// failure is invisible: the shell comes back, and the user types the next
+// command into a terminal that echoes nothing. Both tcsetattr() calls were
+// previously unchecked, so a restore that failed said nothing at all.
+class TerminalMode {
+public:
+    explicit TerminalMode(int descriptor) : descriptor_(descriptor) {
+        saved_ = tcgetattr(descriptor_, &original_) == 0;
+    }
+
+    ~TerminalMode() { restore(); }
+
+    TerminalMode(const TerminalMode&) = delete;
+    TerminalMode& operator=(const TerminalMode&) = delete;
+
+    bool saved() const { return saved_; }
+
+    bool raw() {
+        if (!saved_) {
+            return false;
+        }
+
+        termios mode = original_;
+        mode.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
+        mode.c_cc[VMIN] = 1;
+        mode.c_cc[VTIME] = 0;
+
+        // TCSAFLUSH discards anything typed ahead, so a stray keystroke from
+        // before the prompt cannot stand in for the answer.
+        if (tcsetattr(descriptor_, TCSAFLUSH, &mode) != 0) {
+            return false;
+        }
+
+        changed_ = true;
+        return true;
+    }
+
+    void restore() {
+        if (!changed_) {
+            return;
+        }
+
+        changed_ = false;
+
+        while (tcsetattr(descriptor_, TCSAFLUSH, &original_) != 0) {
+            // A signal arriving mid-call is the one failure worth retrying.
+            if (errno == EINTR) {
+                continue;
+            }
+
+            std::cerr << "Warning: could not restore the terminal: "
+                      << std::strerror(errno)
+                      << "\n  Run 'stty sane' if typing stops echoing.\n";
+            return;
+        }
+    }
+
+private:
+    int descriptor_;
+    termios original_{};
+    bool saved_ = false;
+    bool changed_ = false;
+};
+
 // Takes one keypress without waiting for Enter. Falls back to reading a
 // character from the stream when stdin is a pipe or a file, so scripts still
 // work. Anything but y or Y cancels, end-of-input included.
@@ -854,25 +1118,17 @@ static bool confirmed() {
         return key == 'y' || key == 'Y';
     }
 
-    termios original;
+    TerminalMode terminal(STDIN_FILENO);
 
-    if (tcgetattr(STDIN_FILENO, &original) != 0) {
+    if (!terminal.raw()) {
+        // Without raw mode the answer needs Enter, which is still an answer.
         const int key = std::getchar();
         return key == 'y' || key == 'Y';
     }
 
-    termios raw = original;
-    raw.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
-    raw.c_cc[VMIN] = 1;
-    raw.c_cc[VTIME] = 0;
-
-    // TCSAFLUSH discards anything typed ahead, so a stray keystroke from
-    // before the prompt cannot stand in for the answer.
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
-
     const int key = std::getchar();
 
-    tcsetattr(STDIN_FILENO, TCSAFLUSH, &original);
+    terminal.restore();
 
     return key == 'y' || key == 'Y';
 }
@@ -915,6 +1171,48 @@ static std::string format_size(std::uintmax_t bytes) {
     }
 
     return buffer;
+}
+
+// directory_entry::last_write_time() resolves the link before reading the
+// timestamp, so --older-than judged a symlink by its target -- a link whose
+// own mtime is years old was kept out of the list because the file it points
+// at was touched today, and that file can sit outside the scanned tree
+// entirely. The rest of the scanner treats the link itself as the object and
+// reports it as zero bytes, so the age has to come from the link too.
+//
+// C++17 has no no-follow timestamp query and no conversion from time_t into
+// the filesystem clock, so lstat supplies the former and the offset between
+// the two clocks, sampled once, supplies the latter. The two samples are taken
+// microseconds apart and --older-than resolves to whole seconds.
+static fs::file_time_type from_unix_seconds(std::int64_t seconds) {
+    using Duration = fs::file_time_type::duration;
+
+    static const Duration offset = [] {
+        const auto file_now = fs::file_time_type::clock::now();
+        const auto system_now = std::chrono::system_clock::now();
+        return file_now.time_since_epoch() -
+               std::chrono::duration_cast<Duration>(
+                   system_now.time_since_epoch());
+    }();
+
+    return fs::file_time_type(
+        offset + std::chrono::duration_cast<Duration>(
+                     std::chrono::seconds(seconds)));
+}
+
+// True when the timestamp could be read.
+static bool symlink_write_time(
+    const fs::path& path,
+    fs::file_time_type& when)
+{
+    struct stat info;
+
+    if (::lstat(path.c_str(), &info) != 0) {
+        return false;
+    }
+
+    when = from_unix_seconds(static_cast<std::int64_t>(info.st_mtime));
+    return true;
 }
 
 static std::uintmax_t file_size_or_zero(
@@ -964,6 +1262,22 @@ static void parallel_directories(std::vector<Job> queue, Scan scan) {
     std::condition_variable ready;
     std::size_t active = 0;
     std::exception_ptr failure;
+
+    // Past this many workers the queue is the bottleneck rather than the
+    // filesystem, and on a 128-core host the count-per-core pool meant 127
+    // threads for a scan with work for a handful: stacks, scheduler pressure,
+    // and thread creation itself as a fresh way for a small run to fail.
+    constexpr unsigned int ceiling = 32;
+
+    unsigned int limit = std::thread::hardware_concurrency();
+
+    if (limit == 0) {
+        limit = 1;
+    }
+
+    limit = std::min(limit, ceiling);
+
+    std::vector<std::thread> pool;
 
     const auto worker = [&] {
         std::unique_lock<std::mutex> lock(mutex);
@@ -1018,17 +1332,28 @@ static void parallel_directories(std::vector<Job> queue, Scan scan) {
         }
     };
 
-    unsigned int count = std::thread::hardware_concurrency();
+    // Sized to the machine, not to the work: the queue often starts as a
+    // single directory, and only grows as children are found. Growing the pool
+    // from inside the worker loop to match, which is the obvious answer, was
+    // measured and rejected -- in every form tried (an atomic flag or a
+    // thread-local one, the spawn inlined or out of line, lazily or with the
+    // pool pre-filled) it cost 6-8% of a scan of a real tree, because the
+    // state the growth step needs has to stay live across a very tight loop.
+    // Paying that on every real run to save the 0.7 ms of thread creation on a
+    // run with nothing to do is the wrong way round. The ceiling is what
+    // matters on a many-core host, where the old count-per-core pool meant
+    // hundreds of threads for a scan that had work for a handful.
+    pool.reserve(limit - 1);
 
-    if (count == 0) {
-        count = 1;
-    }
-
-    std::vector<std::thread> pool;
-    pool.reserve(count - 1);
-
-    for (unsigned int i = 0; i + 1 < count; ++i) {
-        pool.emplace_back(worker);
+    for (unsigned int i = 0; i + 1 < limit; ++i) {
+        try {
+            pool.emplace_back(worker);
+        } catch (const std::system_error&) {
+            // The pool is an optimisation: if the process cannot create
+            // another thread the walk still finishes on the ones that did
+            // start, down to this thread alone.
+            break;
+        }
     }
 
     worker();
@@ -1133,10 +1458,36 @@ static void size_directories(
                     newest = entry_time;
                 }
 
-                // Not a symlink, so status() and symlink_status() agree here.
-                if (entry.is_directory(status_ec)) {
+                // Not a symlink, so status() and symlink_status() agree
+                // here. A failed query is reported rather than read as "not a
+                // directory": a permission error or an entry disappearing
+                // mid-walk would otherwise drop a whole subtree from the size
+                // silently, and the documented contract is that an unreadable
+                // path is named and the run exits 1.
+                const bool child_is_directory = entry.is_directory(status_ec);
+
+                if (status_ec) {
+                    local.push_back("Cannot inspect " +
+                                    entry.path().string() + ": " +
+                                    status_ec.message());
+                    continue;
+                }
+
+                if (child_is_directory) {
                     children.push_back({entry.path(), job.target});
-                } else if (entry.is_regular_file(status_ec)) {
+                    continue;
+                }
+
+                const bool child_is_file = entry.is_regular_file(status_ec);
+
+                if (status_ec) {
+                    local.push_back("Cannot inspect " +
+                                    entry.path().string() + ": " +
+                                    status_ec.message());
+                    continue;
+                }
+
+                if (child_is_file) {
                     total = saturating_add(total,
                                            file_size_or_zero(entry, local));
                 }
@@ -1229,9 +1580,27 @@ static std::size_t matching_pattern(
     return patterns.size();
 }
 
-static bool has_entry(const fs::path& directory, std::string_view name) {
+// exists() follows symlinks and is satisfied by anything at all, so a
+// directory named CMakeLists.txt, a FIFO, or a link pointing at some unrelated
+// file elsewhere could license the removal of a build directory in a tree that
+// holds none of the project metadata the guard is supposed to be proving. The
+// documentation calls these marker files, so a marker has to be a regular
+// file, reached without following a link.
+static bool has_marker_file(const fs::path& directory, std::string_view name) {
     std::error_code ec;
-    return fs::exists(directory / std::string(name), ec);
+    const fs::file_status status =
+        fs::symlink_status(directory / std::string(name), ec);
+    return !ec && status.type() == fs::file_type::regular;
+}
+
+// .git is the one marker that is normally a directory: a working tree carries
+// a .git directory and a submodule or worktree carries a .git file pointing
+// at the real one. Both are accepted, a symlink is not.
+static bool has_repository(const fs::path& directory) {
+    std::error_code ec;
+    const fs::file_status status = fs::symlink_status(directory / ".git", ec);
+    return !ec && (status.type() == fs::file_type::directory ||
+                   status.type() == fs::file_type::regular);
 }
 
 // "build" and "target" are ordinary names, so they only count as artifacts
@@ -1255,7 +1624,7 @@ static bool has_enclosing_project(fs::path project, const fs::path& root) {
 
         project = parent;
 
-        if (has_entry(project, ".git")) {
+        if (has_repository(project)) {
             return true;
         }
     }
@@ -1311,7 +1680,7 @@ static bool is_artifact_directory(
         }
     }
 
-    if (!configured_project && !has_entry(project, ".git")) {
+    if (!configured_project && !has_repository(project)) {
         return false;
     }
 
@@ -1322,7 +1691,7 @@ static bool is_artifact_directory(
 
     for (const defaults::Artifact& artifact : defaults::artifacts) {
         if (artifact.directory == name &&
-            has_entry(project, artifact.marker)) {
+            has_marker_file(project, artifact.marker)) {
             return true;
         }
     }
@@ -1337,7 +1706,7 @@ static bool is_dependency_directory(
 {
     for (const defaults::Artifact& dependency : defaults::dependencies) {
         if (dependency.directory == name &&
-            has_entry(directory.parent_path(), dependency.marker)) {
+            has_marker_file(directory.parent_path(), dependency.marker)) {
             return true;
         }
     }
@@ -1345,7 +1714,7 @@ static bool is_dependency_directory(
     // gate as the built-ins, which is what separates them from a pattern.
     for (const auto& dependency : configured) {
         if (dependency.first == name &&
-            has_entry(directory.parent_path(), dependency.second)) {
+            has_marker_file(directory.parent_path(), dependency.second)) {
             return true;
         }
     }
@@ -1441,6 +1810,12 @@ static void scan_tree(
                 const bool is_directory =
                     !is_symlink && entry.is_directory(status_ec);
 
+                if (status_ec) {
+                    local.push_back("Cannot inspect " + path.string() + ": " +
+                                    status_ec.message());
+                    continue;
+                }
+
                 const std::size_t pattern_index =
                     matching_pattern(path, root, filename, patterns);
                 const bool artifact = build_artifacts && is_directory &&
@@ -1467,9 +1842,14 @@ static void scan_tree(
                 // "Cannot apply age filter" error for the same target; warning
                 // here as well made every run without the filter exit 1 over a
                 // value it never read.
-                std::error_code time_ec;
-                target.newest_time = entry.last_write_time(time_ec);
-                target.has_time = !time_ec;
+                if (is_symlink) {
+                    target.has_time =
+                        symlink_write_time(path, target.newest_time);
+                } else {
+                    std::error_code time_ec;
+                    target.newest_time = entry.last_write_time(time_ec);
+                    target.has_time = !time_ec;
+                }
                 if (artifact) {
                     target.reason = "build-artifact";
                 } else if (dependency) {
@@ -1482,14 +1862,23 @@ static void scan_tree(
                     target.reason = "command-line";
                 }
 
-                if (!is_directory && !is_symlink &&
-                    entry.is_regular_file(status_ec)) {
-                    target.size = file_size_or_zero(entry, local);
-                } else {
-                    // A matched directory is sized later, in one pass over
-                    // all of them. Symlinks and other special files have no
-                    // ordinary size.
-                    target.size = 0;
+                // A matched directory is sized later, in one pass over all
+                // of them. Symlinks and other special files have no ordinary
+                // size.
+                target.size = 0;
+
+                if (!is_directory && !is_symlink) {
+                    const bool is_file = entry.is_regular_file(status_ec);
+
+                    if (status_ec) {
+                        // The target is still listed, at an unknown size,
+                        // rather than dropped: it matched a pattern, and
+                        // hiding it would be the more surprising outcome.
+                        local.push_back("Cannot inspect " + path.string() +
+                                        ": " + status_ec.message());
+                    } else if (is_file) {
+                        target.size = file_size_or_zero(entry, local);
+                    }
                 }
 
                 local_targets.push_back(std::move(target));
@@ -1573,25 +1962,123 @@ static std::string skipped_directories() {
     return list;
 }
 
-static std::string json_string(const std::string& value) {
-    std::string result = "\"";
+// A POSIX filename is a byte string: it can hold a newline, an ESC, or a
+// complete CSI sequence, and it need not be valid UTF-8. Both matter here,
+// because the matched list is exactly what the user reads before confirming a
+// permanent deletion -- a name carrying a newline and some spaces can forge a
+// second entry in that list, and one carrying ESC[2K can erase a real entry
+// that was already printed.
+//
+// Every C0 control and DEL is therefore shown as \xNN, and a literal backslash
+// is doubled so the escape is unambiguous. High bytes are passed through: they
+// carry ordinary non-ASCII names, and a terminal does not act on them.
+static std::string display(const std::string& value) {
+    std::string result;
+    result.reserve(value.size());
+
     for (const unsigned char c : value) {
-        switch (c) {
-        case '"': result += "\\\""; break;
-        case '\\': result += "\\\\"; break;
-        case '\n': result += "\\n"; break;
-        case '\r': result += "\\r"; break;
-        case '\t': result += "\\t"; break;
-        default:
-            if (c < 0x20) {
-                char escaped[7];
-                std::snprintf(escaped, sizeof(escaped), "\\u%04x", c);
-                result += escaped;
-            } else {
-                result += static_cast<char>(c);
-            }
+        if (c == '\\') {
+            result += "\\\\";
+        } else if (c < 0x20 || c == 0x7f) {
+            char escaped[5];
+            std::snprintf(escaped, sizeof(escaped), "\\x%02x", c);
+            result += escaped;
+        } else {
+            result += static_cast<char>(c);
         }
     }
+
+    return result;
+}
+
+static std::string display(const fs::path& path) {
+    return display(path.string());
+}
+
+// Length of the UTF-8 sequence starting at `value[position]`, or 0 when the
+// bytes there are not a well-formed, shortest-form, in-range sequence.
+static std::size_t utf8_sequence_length(
+    const std::string& value,
+    std::size_t position)
+{
+    const auto byte = [&](std::size_t offset) {
+        return static_cast<unsigned char>(value[position + offset]);
+    };
+
+    const unsigned char lead = byte(0);
+    std::size_t length = 0;
+
+    if (lead < 0x80) return 1;
+    else if (lead >= 0xc2 && lead <= 0xdf) length = 2;
+    else if (lead >= 0xe0 && lead <= 0xef) length = 3;
+    else if (lead >= 0xf0 && lead <= 0xf4) length = 4;
+    else return 0;
+
+    if (position + length > value.size()) {
+        return 0;
+    }
+
+    for (std::size_t i = 1; i < length; ++i) {
+        if (byte(i) < 0x80 || byte(i) > 0xbf) {
+            return 0;
+        }
+    }
+
+    // Overlong forms and the surrogate and out-of-range blocks share a lead
+    // byte with valid sequences, so they are separated on the second byte.
+    if (lead == 0xe0 && byte(1) < 0xa0) return 0;
+    if (lead == 0xed && byte(1) > 0x9f) return 0;
+    if (lead == 0xf0 && byte(1) < 0x90) return 0;
+    if (lead == 0xf4 && byte(1) > 0x8f) return 0;
+
+    return length;
+}
+
+// JSON is defined over text, not bytes, so emitting a filename verbatim
+// produced output that a conforming parser rejects outright: a single
+// undecodable byte in one name failed the whole document, warnings and totals
+// included. Bytes that are not valid UTF-8 become U+FFFD, one per byte, which
+// is the substitution the Unicode standard prescribes; the escaping policy is
+// documented in the README so a consumer knows the path may be lossy and the
+// human output remains the faithful form.
+static std::string json_string(const std::string& value) {
+    std::string result = "\"";
+    std::size_t position = 0;
+
+    while (position < value.size()) {
+        const auto c = static_cast<unsigned char>(value[position]);
+
+        if (c < 0x80) {
+            switch (c) {
+            case '"': result += "\\\""; break;
+            case '\\': result += "\\\\"; break;
+            case '\n': result += "\\n"; break;
+            case '\r': result += "\\r"; break;
+            case '\t': result += "\\t"; break;
+            default:
+                if (c < 0x20 || c == 0x7f) {
+                    char escaped[7];
+                    std::snprintf(escaped, sizeof(escaped), "\\u%04x", c);
+                    result += escaped;
+                } else {
+                    result += static_cast<char>(c);
+                }
+            }
+            ++position;
+            continue;
+        }
+
+        const std::size_t length = utf8_sequence_length(value, position);
+
+        if (length == 0) {
+            result += "\xef\xbf\xbd";  // U+FFFD REPLACEMENT CHARACTER
+            ++position;
+        } else {
+            result.append(value, position, length);
+            position += length;
+        }
+    }
+
     result += '"';
     return result;
 }
@@ -1677,22 +2164,195 @@ static void print_json(
     std::cout << "\n  ]\n}\n";
 }
 
-static bool validate_target(const Target& target, std::string& error) {
-    std::error_code ec;
-    const fs::file_status status = fs::symlink_status(target.path, ec);
-    if (ec || status.type() == fs::file_type::not_found) {
-        error = "Target changed or disappeared: " + target.path.string();
+// Deletion boundary.
+//
+// Checking a path and then removing it by that same path is two lookups of
+// the same name, and between them a concurrent process can put something else
+// there. A type check narrows that but does not close it: a regular file can
+// be replaced by another regular file, and fs::remove_all() re-resolves every
+// component of every path in the subtree as it walks, so the race repeats at
+// each level. In a tree another user can write to, that is enough to delete an
+// object the user never reviewed.
+//
+// Everything below is descriptor-relative instead. The parent directory is
+// opened once, the identity check runs against that descriptor, and the
+// removal names the entry within it, so a component swapped after the check
+// cannot be reached by name at all. O_NOFOLLOW at every open means a symlink
+// substituted for a directory is an error rather than a way out of the tree.
+
+static std::string errno_message(const fs::path& path) {
+    return path.string() + ": " + std::strerror(errno);
+}
+
+// The entries are read out in full before any of them is unlinked. Removing
+// from a directory while its stream is still open leaves the fate of the
+// not-yet-returned entries unspecified by POSIX.
+static bool read_directory(
+    DIR* stream,
+    const fs::path& shown,
+    std::vector<std::string>& names,
+    std::string& error)
+{
+    bool ok = true;
+
+    while (true) {
+        errno = 0;
+        const dirent* entry = ::readdir(stream);
+
+        if (entry == nullptr) {
+            if (errno != 0) {
+                error = errno_message(shown);
+                ok = false;
+            }
+            break;
+        }
+
+        const std::string name = entry->d_name;
+
+        if (name != "." && name != "..") {
+            names.push_back(name);
+        }
+    }
+
+    return ok;
+}
+
+// One descriptor and one stack frame are held per level, for as long as the
+// level below is being emptied. That is the price of the property: the
+// descriptor is what makes the next step relative to a directory that has
+// already been checked rather than to a name that can be re-pointed. A tree
+// deep enough to exhaust either limit fails with a reported error on the
+// openat() rather than removing the wrong thing, and cannot be built through
+// the ordinary filesystem calls in the first place.
+static bool remove_entry_at(
+    int parent,
+    const std::string& name,
+    const fs::path& shown,
+    std::string& error)
+{
+    // The unlink is attempted before anything is known about the entry, rather
+    // than after a stat that says what it is. Files outnumber directories in
+    // the trees this removes, so it is one syscall where a stat first was two
+    // -- but the reason is that the kernel then makes the decision atomically.
+    // unlinkat() without AT_REMOVEDIR removes a symlink and never its target,
+    // and refuses a directory outright, so there is no window between deciding
+    // and acting for the two to disagree about.
+    if (::unlinkat(parent, name.c_str(), 0) == 0) {
+        return true;
+    }
+
+    // Linux reports a directory here as EISDIR, the BSDs as EPERM. Either can
+    // also be a genuine failure on something that is not a directory, which is
+    // what the openat below separates.
+    const int unlink_errno = errno;
+
+    if (unlink_errno != EISDIR && unlink_errno != EPERM) {
+        error = errno_message(shown);
         return false;
     }
 
-    const bool is_symlink = status.type() == fs::file_type::symlink;
-    const bool is_directory = status.type() == fs::file_type::directory;
+    const int directory = ::openat(parent, name.c_str(),
+                                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                   O_CLOEXEC);
+
+    if (directory < 0) {
+        // Not a directory after all, so the unlink was the real attempt and
+        // its error is the one worth reporting.
+        if (errno == ENOTDIR || errno == ELOOP) {
+            errno = unlink_errno;
+        }
+
+        error = errno_message(shown);
+        return false;
+    }
+
+    // fdopendir() takes ownership of the descriptor, and closedir() closes it,
+    // so the stream is kept open until the children are gone and dirfd() is
+    // what the recursion descends through.
+    DIR* stream = ::fdopendir(directory);
+
+    if (stream == nullptr) {
+        error = errno_message(shown);
+        ::close(directory);
+        return false;
+    }
+
+    std::vector<std::string> names;
+    bool ok = read_directory(stream, shown, names, error);
+
+    if (ok) {
+        for (const std::string& child : names) {
+            if (!remove_entry_at(::dirfd(stream), child, shown / child,
+                                 error)) {
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    ::closedir(stream);
+
+    if (!ok) {
+        return false;
+    }
+
+    if (::unlinkat(parent, name.c_str(), AT_REMOVEDIR) != 0) {
+        error = errno_message(shown);
+        return false;
+    }
+
+    return true;
+}
+
+// Opens the reviewed target's parent, confirms the entry still has the type it
+// had when the list was shown, and removes it through that descriptor.
+static bool remove_target(const Target& target, std::string& error) {
+    const fs::path parent_path = target.path.parent_path();
+    const std::string name = target.path.filename().string();
+
+    if (name.empty() || name == "." || name == "..") {
+        error = "Target is not a removable entry: " + target.path.string();
+        return false;
+    }
+
+    // No O_NOFOLLOW on this one: ROOT itself may legitimately have been
+    // reached through a symlinked path, and the user named it. Every open
+    // below ROOT, where the names come from the scan rather than from the
+    // user, refuses to follow one.
+    const int parent = ::open(parent_path.empty() ? "."
+                                                  : parent_path.c_str(),
+                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+    if (parent < 0) {
+        error = errno == ENOENT
+            ? "Target changed or disappeared: " + target.path.string()
+            : errno_message(parent_path);
+        return false;
+    }
+
+    struct stat info;
+
+    if (::fstatat(parent, name.c_str(), &info, AT_SYMLINK_NOFOLLOW) != 0) {
+        error = errno == ENOENT
+            ? "Target changed or disappeared: " + target.path.string()
+            : errno_message(target.path);
+        ::close(parent);
+        return false;
+    }
+
+    const bool is_symlink = S_ISLNK(info.st_mode);
+    const bool is_directory = S_ISDIR(info.st_mode);
+
     if (is_symlink != target.is_symlink ||
         (!target.is_symlink && is_directory != target.is_directory)) {
         error = "Target changed type: " + target.path.string();
+        ::close(parent);
         return false;
     }
-    return true;
+
+    const bool ok = remove_entry_at(parent, name, target.path, error);
+    ::close(parent);
+    return ok;
 }
 
 static void print_usage(const char* program) {
@@ -2106,8 +2766,8 @@ int main(int argc, char* argv[]) {
                     errors.push_back("Cannot apply age filter to " +
                                      target.path.string());
                     keep = false;
-                } else if (target.newest_time >
-                           now - *older_limit) {
+                } else if (!is_older_than(target.newest_time, now,
+                                          *older_limit)) {
                     keep = false;
                 }
             }
@@ -2127,7 +2787,7 @@ int main(int argc, char* argv[]) {
     if (!errors.empty()) {
         std::cerr << '\n' << err.warning << "Warnings:" << err.reset << '\n';
         for (const auto& error : errors) {
-            std::cerr << "  " << error << '\n';
+            std::cerr << "  " << display(error) << '\n';
         }
     }
 
@@ -2158,10 +2818,10 @@ int main(int argc, char* argv[]) {
 
         for (const auto& target : targets) {
             if (target.is_directory) {
-                std::cout << "  " << out.directory << target.path.string() << '/'
+                std::cout << "  " << out.directory << display(target.path) << '/'
                           << out.reset;
             } else {
-                std::cout << "  " << target.path.string();
+                std::cout << "  " << display(target.path);
             }
 
             std::cout << out.dim << "  " << format_size(target.size) << out.reset
@@ -2219,36 +2879,19 @@ int main(int argc, char* argv[]) {
     // The matched list was already shown, so only failures are named again.
     // --verbose restores the per-item log.
     for (const auto& target : targets) {
-        std::string validation_error;
-        if (!validate_target(target, validation_error)) {
+        std::string removal_error;
+
+        if (!remove_target(target, removal_error)) {
             ++failed;
-            errors.push_back(validation_error);
-            if (!format_json) {
-                std::cerr << "  " << err.failure << "failed" << err.reset << "  "
-                          << validation_error << '\n';
-            }
-            continue;
-        }
-
-        std::error_code remove_ec;
-
-        if (target.is_directory) {
-            fs::remove_all(target.path, remove_ec);
-        } else {
-            fs::remove(target.path, remove_ec);
-        }
-
-        if (remove_ec) {
-            ++failed;
+            errors.push_back(removal_error);
             std::cerr << "  " << err.failure << "failed" << err.reset << "  "
-                      << target.path.string() << ": "
-                      << remove_ec.message() << '\n';
+                      << display(removal_error) << '\n';
         } else {
             ++removed;
 
             if (verbose && !format_json) {
                 std::cout << "  " << out.dim << "removed" << out.reset << "  "
-                          << target.path.string() << '\n';
+                          << display(target.path) << '\n';
             }
         }
     }

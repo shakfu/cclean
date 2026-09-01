@@ -559,6 +559,235 @@ void test_artifact_detection() {
     CHECK(is_artifact_directory(submodule / "build", "build", tree.root()));
 }
 
+// ------------------------------------------------------ numeric parsing
+
+// The previous parser went through double and range-checked against
+// static_cast<double>(the integer maximum). Neither maximum is representable
+// as a double, so the bound rounded up to the next power of two and a value
+// written at the boundary passed the check and then reached an out-of-range
+// floating-to-integer conversion, which is undefined.
+void test_parse_size() {
+    group("parse_size");
+
+    CHECK_EQ(parse_size("0").value(), 0u);
+    CHECK_EQ(parse_size("0B").value(), 0u);
+    CHECK_EQ(parse_size("1B").value(), 1u);
+    CHECK_EQ(parse_size("512").value(), 512u);
+    CHECK_EQ(parse_size("1K").value(), 1024u);
+    CHECK_EQ(parse_size("1KiB").value(), 1024u);
+    CHECK_EQ(parse_size("1M").value(), 1024u * 1024);
+    CHECK_EQ(parse_size("1G").value(), 1024u * 1024 * 1024);
+    CHECK_EQ(parse_size("1T").value(), 1024ull * 1024 * 1024 * 1024);
+
+    // Fixed point, truncated toward zero, exact at every step.
+    CHECK_EQ(parse_size("1.5K").value(), 1536u);
+    CHECK_EQ(parse_size("0.5B").value(), 0u);
+    CHECK_EQ(parse_size("2.25M").value(), 2359296u);
+    CHECK_EQ(parse_size(".5K").value(), 512u);
+    CHECK_EQ(parse_size("1.001K").value(), 1025u);
+
+    const auto maximum = std::numeric_limits<std::uintmax_t>::max();
+    CHECK_EQ(parse_size("18446744073709551615").value(), maximum);
+    CHECK_EQ(parse_size("18446744073709551615B").value(), maximum);
+    CHECK(!parse_size("18446744073709551616B").has_value());
+    CHECK(!parse_size("99999999999999999999999B").has_value());
+
+    // 16777216T is exactly 2^64 bytes: one past the representable maximum.
+    CHECK_EQ(parse_size("16777215T").value(), 16777215ull * 1024 * 1024 * 1024 * 1024);
+    CHECK(!parse_size("16777216T").has_value());
+
+    CHECK(!parse_size("").has_value());
+    CHECK(!parse_size("B").has_value());
+    CHECK(!parse_size(".").has_value());
+    CHECK(!parse_size(".B").has_value());
+    CHECK(!parse_size("-1B").has_value());
+    CHECK(!parse_size("1.2.3B").has_value());
+    CHECK(!parse_size("1e3B").has_value());
+    CHECK(!parse_size("1X").has_value());
+    CHECK(!parse_size("1 K").has_value());
+    CHECK(!parse_size("nonsense").has_value());
+}
+
+void test_parse_duration() {
+    group("parse_duration");
+
+    CHECK_EQ(parse_duration("1s").value().count(), 1);
+    CHECK_EQ(parse_duration("0s").value().count(), 0);
+    CHECK_EQ(parse_duration("90m").value().count(), 5400);
+    CHECK_EQ(parse_duration("2h").value().count(), 7200);
+    CHECK_EQ(parse_duration("1d").value().count(), 86400);
+    CHECK_EQ(parse_duration("1w").value().count(), 604800);
+    CHECK_EQ(parse_duration("0.5d").value().count(), 43200);
+    CHECK_EQ(parse_duration("1.5h").value().count(), 5400);
+
+    const auto maximum = std::numeric_limits<std::int64_t>::max();
+    CHECK_EQ(parse_duration("9223372036854775807s").value().count(), maximum);
+    CHECK(!parse_duration("9223372036854775808s").has_value());
+    CHECK(!parse_duration("9223372036854775807w").has_value());
+
+    // The unit has to be the only thing left, or "1dd" reads as one day.
+    CHECK(!parse_duration("1dd").has_value());
+    CHECK(!parse_duration("1d5d").has_value());
+    CHECK(!parse_duration("1").has_value());
+    CHECK(!parse_duration("d").has_value());
+    CHECK(!parse_duration("-1d").has_value());
+    CHECK(!parse_duration("1e3d").has_value());
+    CHECK(!parse_duration("1.2.3d").has_value());
+    CHECK(!parse_duration("").has_value());
+    CHECK(!parse_duration("1y").has_value());
+}
+
+// now - limit is not representable for a large --older-than: the filesystem
+// clock counts nanoseconds in 64 bits.
+void test_age_comparison() {
+    group("is_older_than");
+
+    const auto now = fs::file_time_type::clock::now();
+    const auto hour = std::chrono::seconds(3600);
+
+    CHECK(is_older_than(now - std::chrono::hours(2), now, hour));
+    CHECK(!is_older_than(now - std::chrono::minutes(10), now, hour));
+    CHECK(is_older_than(now, now, std::chrono::seconds(0)));
+
+    // Nothing is old enough, and nothing overflows on the way to saying so.
+    const auto forever =
+        std::chrono::seconds(std::numeric_limits<std::int64_t>::max());
+    CHECK(!is_older_than(now - std::chrono::hours(24 * 365), now, forever));
+}
+
+// ---------------------------------------------------------- output escaping
+
+// A POSIX filename is a byte string. The matched list is what the user reads
+// before confirming a permanent deletion, so a name must not be able to forge
+// a line in it or erase one that was already printed.
+void test_display_escaping() {
+    group("display");
+
+    CHECK_EQ(display(std::string("plain.pyc")), std::string("plain.pyc"));
+    CHECK_EQ(display(std::string("two\nlines")), std::string("two\\x0alines"));
+    CHECK_EQ(display(std::string("ret\rurn")), std::string("ret\\x0durn"));
+    CHECK_EQ(display(std::string("\033[2K")), std::string("\\x1b[2K"));
+    CHECK_EQ(display(std::string("\x7f")), std::string("\\x7f"));
+    CHECK_EQ(display(std::string("back\\slash")),
+             std::string("back\\\\slash"));
+
+    // Ordinary non-ASCII names are left alone: a terminal does not act on
+    // them, and mangling them would make the list harder to read, not safer.
+    CHECK_EQ(display(std::string("h\xc3\xa9llo")),
+             std::string("h\xc3\xa9llo"));
+}
+
+// JSON is defined over text, so a single undecodable byte in one name used to
+// make the whole document unparseable, totals and warnings included.
+void test_json_string() {
+    group("json_string");
+
+    CHECK_EQ(json_string("plain"), std::string("\"plain\""));
+    CHECK_EQ(json_string("a\"b"), std::string("\"a\\\"b\""));
+    CHECK_EQ(json_string("a\\b"), std::string("\"a\\\\b\""));
+    CHECK_EQ(json_string("a\nb"), std::string("\"a\\nb\""));
+    CHECK_EQ(json_string("a\tb"), std::string("\"a\\tb\""));
+    CHECK_EQ(json_string(std::string("\x01")), std::string("\"\\u0001\""));
+    CHECK_EQ(json_string(std::string("\x7f")), std::string("\"\\u007f\""));
+
+    // Well-formed UTF-8 passes through untouched, at every sequence length.
+    CHECK_EQ(json_string("h\xc3\xa9llo"), std::string("\"h\xc3\xa9llo\""));
+    CHECK_EQ(json_string("\xe2\x82\xac"), std::string("\"\xe2\x82\xac\""));
+    CHECK_EQ(json_string("\xf0\x9f\x92\xa9"),
+             std::string("\"\xf0\x9f\x92\xa9\""));
+
+    // One replacement character per undecodable byte.
+    const std::string replacement = "\xef\xbf\xbd";
+    CHECK_EQ(json_string("\xff"), "\"" + replacement + "\"");
+    CHECK_EQ(json_string("a\xff" "b"), "\"a" + replacement + "b\"");
+    CHECK_EQ(json_string("\xc3"), "\"" + replacement + "\"");
+    CHECK_EQ(json_string("\xc3\x28"), "\"" + replacement + "(\"");
+    // Overlong, surrogate, and out-of-range forms are not valid UTF-8.
+    CHECK_EQ(json_string("\xc0\xaf"), "\"" + replacement + replacement + "\"");
+    CHECK_EQ(json_string("\xed\xa0\x80"),
+             "\"" + replacement + replacement + replacement + "\"");
+    CHECK_EQ(json_string("\xf5\x80\x80\x80"),
+             "\"" + replacement + replacement + replacement + replacement +
+             "\"");
+}
+
+// ---------------------------------------------------------- config parsing
+
+// Skipping every comma before the next value accepted [, "a"] and ["a",,"b"],
+// so a typo in a committed configuration changed what a run deleted in
+// silence. TOML has no empty array element.
+void test_string_array_parsing() {
+    group("parse_string_array");
+
+    std::vector<std::string> values;
+
+    CHECK(parse_string_array("[]", values));
+    CHECK_EQ(values.size(), 0u);
+
+    values.clear();
+    CHECK(parse_string_array("[\"*.tmp\"]", values));
+    CHECK_EQ(values.size(), 1u);
+    CHECK_EQ(values[0], std::string("*.tmp"));
+
+    values.clear();
+    CHECK(parse_string_array("  [ \"a\" ,  \"b\" ]  ", values));
+    CHECK_EQ(values.size(), 2u);
+    CHECK_EQ(values[1], std::string("b"));
+
+    // TOML allows one trailing comma, and nothing else.
+    values.clear();
+    CHECK(parse_string_array("[\"a\",]", values));
+    CHECK_EQ(values.size(), 1u);
+
+    values.clear();
+    CHECK(!parse_string_array("[, \"a\"]", values));
+    CHECK(!parse_string_array("[\"a\",,\"b\"]", values));
+    CHECK(!parse_string_array("[\"a\" \"b\"]", values));
+    CHECK(!parse_string_array("[\"a\",,]", values));
+    CHECK(!parse_string_array("[\"unclosed]", values));
+    CHECK(!parse_string_array("[a]", values));
+    CHECK(!parse_string_array("[\"a\\\\b\"]", values));
+    CHECK(!parse_string_array("\"a\"", values));
+}
+
+void test_pair_array_parsing() {
+    group("parse_pair_array");
+
+    std::vector<std::pair<std::string, std::string>> pairs;
+
+    CHECK(parse_pair_array("[]", pairs));
+    CHECK_EQ(pairs.size(), 0u);
+
+    pairs.clear();
+    CHECK(parse_pair_array("[[\"deps\", \"mix.exs\"]]", pairs));
+    CHECK_EQ(pairs.size(), 1u);
+    CHECK_EQ(pairs[0].first, std::string("deps"));
+    CHECK_EQ(pairs[0].second, std::string("mix.exs"));
+
+    pairs.clear();
+    CHECK(parse_pair_array("[[\"a\",\"b\"], [\"c\",\"d\"],]", pairs));
+    CHECK_EQ(pairs.size(), 2u);
+
+    // The outer parser used to look for the next ] textually, which rejected
+    // a perfectly ordinary POSIX name that contains one.
+    pairs.clear();
+    CHECK(parse_pair_array("[[\"vendor\", \"we]ird.lock\"]]", pairs));
+    CHECK_EQ(pairs.size(), 1u);
+    CHECK_EQ(pairs[0].second, std::string("we]ird.lock"));
+
+    pairs.clear();
+    CHECK(!parse_pair_array("[[\"a\",\"b\"] [\"c\",\"d\"]]", pairs));
+    CHECK(!parse_pair_array("[, [\"a\",\"b\"]]", pairs));
+    CHECK(!parse_pair_array("[[\"a\"]]", pairs));
+    CHECK(!parse_pair_array("[[\"a\",\"b\",\"c\"]]", pairs));
+    // A marker is looked up beside the directory, so it has to be a plain
+    // name: a separator would reach outside it.
+    CHECK(!parse_pair_array("[[\"a\",\"../b\"]]", pairs));
+    CHECK(!parse_pair_array("[[\"a\",\"b/c\"]]", pairs));
+    CHECK(!parse_pair_array("[[\"a\",\"\"]]", pairs));
+    CHECK(!parse_pair_array("[[\"a\",\"b\"]", pairs));
+}
+
 // ------------------------------------------------- parallel_directories
 
 // A scan that throws must not strand the worker count or reach a thread
@@ -623,6 +852,13 @@ int main() {
     test_format_size();
     test_saturating_add();
     test_artifact_detection();
+    test_parse_size();
+    test_parse_duration();
+    test_age_comparison();
+    test_display_escaping();
+    test_json_string();
+    test_string_array_parsing();
+    test_pair_array_parsing();
     test_parallel_scan_propagates_exceptions();
 
     if (g_failures == 0) {

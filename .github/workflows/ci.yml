@@ -1,0 +1,82 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # The ordinary build, on both toolchains and both platforms the project
+  # claims to support. Warnings are errors here so a warning cannot survive
+  # long enough to become normal.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            cc: gcc
+            cxx: g++
+          - os: ubuntu-latest
+            cc: clang
+            cxx: clang++
+          - os: macos-latest
+            cc: clang
+            cxx: clang++
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        env:
+          CC: ${{ matrix.cc }}
+          CXX: ${{ matrix.cxx }}
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  # The filesystem races, the numeric limits, and the malformed-input paths
+  # are exactly the classes of defect that only show up under instrumentation,
+  # so both suites run under the sanitizers rather than only the build.
+  sanitizers:
+    strategy:
+      fail-fast: false
+      matrix:
+        sanitizer: ["address,undefined", "thread"]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_CXX_FLAGS="-fsanitize=${{ matrix.sanitizer }} -fno-omit-frame-pointer -g -O1"
+          -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=${{ matrix.sanitizer }}"
+      - name: Build
+        run: cmake --build build -j
+      # ThreadSanitizer needs a predictable address space, which the runner's
+      # ASLR does not give it.
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          TSAN_OPTIONS: halt_on_error=1
+        run: setarch -R ctest --test-dir build --output-on-failure
+
+  # The permission tests are no-ops for root, and the container default is
+  # root, so the suite is also run as an unprivileged user.
+  unprivileged:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j
+      - name: Test as a non-root user
+        run: |
+          sudo useradd -m runner-unprivileged
+          sudo chmod -R a+rX "$PWD"
+          sudo -u runner-unprivileged sh tests/cli.sh "$PWD/build/cclean"
+          sudo -u runner-unprivileged "$PWD/build/cclean_unit"
