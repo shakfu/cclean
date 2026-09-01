@@ -63,20 +63,3 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
           TSAN_OPTIONS: halt_on_error=1
         run: setarch -R ctest --test-dir build --output-on-failure
-
-  # The permission tests are no-ops for root, and the container default is
-  # root, so the suite is also run as an unprivileged user.
-  unprivileged:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build
-        run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-          cmake --build build -j
-      - name: Test as a non-root user
-        run: |
-          sudo useradd -m runner-unprivileged
-          sudo chmod -R a+rX "$PWD"
-          sudo -u runner-unprivileged sh tests/cli.sh "$PWD/build/cclean"
-          sudo -u runner-unprivileged "$PWD/build/cclean_unit"

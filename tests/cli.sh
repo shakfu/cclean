@@ -46,6 +46,14 @@ check() {
     fi
 }
 
+# Root holds DAC_OVERRIDE and DAC_READ_SEARCH, so a directory made unreadable
+# or unwritable still denies it nothing: the checks that set those bits get
+# neither a warning nor a failed removal. Both assert exit status 1, so under
+# root they report a failure rather than testing anything.
+unprivileged() {
+    [ "$(id -u)" -ne 0 ]
+}
+
 # Builds a fresh tree and echoes its path: three matching targets, plus a
 # source file and a log file that no default pattern names.
 fixture() {
@@ -374,18 +382,22 @@ check "JSON reports removal" 1 "$(grep -c '\"status\": \"removed\"' "$json")"
 
 # A scan warning sets exit 1 but must not relabel a dry run as a failed
 # removal: status reports the action, warnings are their own array.
-d=$WORK/json_warn
-rm -rf "$d"
-mkdir -p "$d/locked" "$d/ok"
-printf 'x' > "$d/ok/a.pyc"
-chmod 000 "$d/locked"
-"$CCLEAN" -n --format json "$d" >"$json" 2>/dev/null
-check "scan warning exits 1" 1 $?
-check "warning keeps the dry-run status" 1 \
-      "$(grep -c '\"status\": \"dry-run\"' "$json")"
-check "warning is reported in the JSON" 1 \
-      "$(grep -c 'Permission denied' "$json")"
-chmod 755 "$d/locked"
+if unprivileged; then
+    d=$WORK/json_warn
+    rm -rf "$d"
+    mkdir -p "$d/locked" "$d/ok"
+    printf 'x' > "$d/ok/a.pyc"
+    chmod 000 "$d/locked"
+    "$CCLEAN" -n --format json "$d" >"$json" 2>/dev/null
+    check "scan warning exits 1" 1 $?
+    check "warning keeps the dry-run status" 1 \
+          "$(grep -c '\"status\": \"dry-run\"' "$json")"
+    check "warning is reported in the JSON" 1 \
+          "$(grep -c 'Permission denied' "$json")"
+    chmod 755 "$d/locked"
+else
+    echo "  SKIP  unreadable directory: root reads it anyway"
+fi
 
 # ------------------------------------------------------------- exit codes
 
@@ -430,14 +442,18 @@ mkdir -p "$d"
 check "no matches exits 0" 0 $?
 
 # A directory the process cannot write to cannot have its children removed.
-d=$WORK/locked
-rm -rf "$d"
-mkdir -p "$d/p/__pycache__"
-printf 'x' > "$d/p/__pycache__/a.pyc"
-chmod 555 "$d/p"
-printf 'y' | "$CCLEAN" "$d" >/dev/null 2>&1
-check "failed removal exits 1" 1 $?
-chmod 755 "$d/p"
+if unprivileged; then
+    d=$WORK/locked
+    rm -rf "$d"
+    mkdir -p "$d/p/__pycache__"
+    printf 'x' > "$d/p/__pycache__/a.pyc"
+    chmod 555 "$d/p"
+    printf 'y' | "$CCLEAN" "$d" >/dev/null 2>&1
+    check "failed removal exits 1" 1 $?
+    chmod 755 "$d/p"
+else
+    echo "  SKIP  unwritable parent: root unlinks through it anyway"
+fi
 
 # ------------------------------------------------------------- default root
 
