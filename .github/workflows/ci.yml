@@ -25,7 +25,7 @@ jobs:
             cxx: clang++
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure
         env:
           CC: ${{ matrix.cc }}
@@ -46,7 +46,7 @@ jobs:
         sanitizer: ["address,undefined", "thread"]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Configure
         run: >
           cmake -S . -B build
