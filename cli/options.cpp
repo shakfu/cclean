@@ -18,7 +18,7 @@ void print_usage(const char* program) {
         << "  -b, --build-artifacts\n"
         << "                 Also remove a project's build output, listed\n"
         << "                 below\n"
-        << "      --dependencies\n"
+        << "  -d, --dependencies\n"
         << "                 Also remove marker-guarded dependency trees\n"
         << "  -e, --exclude PATTERN\n"
         << "                 Leave anything matching PATTERN alone, contents\n"
@@ -118,7 +118,7 @@ bool parse_command_line(
                 continue;
             }
 
-            if (argument == "--dependencies") {
+            if (argument == "-d" || argument == "--dependencies") {
                 command_line.dependencies = true;
                 command_line.set_dependencies = true;
                 continue;

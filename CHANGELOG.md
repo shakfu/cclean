@@ -6,6 +6,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- `-d` as a short form of `--dependencies`, matching the short options the other mode flags already carry.
+
 - `libcclean`, a static library holding everything that finds, sizes and removes, with `cclean` reduced to a frontend over it. `make install` now installs `lib/libcclean.a` and the headers under `include/cclean/` beside the binary. The entry point is `scan()`, which walks a root, sizes matched directories, applies the age and size filters, and returns the targets sorted by path; `remove_target()` is the deletion boundary. The library touches no terminal, prints nothing of its own, and reads no environment variable.
 
 - A CI workflow: GCC and Clang on Linux and Clang on macOS, and both suites under AddressSanitizer with UndefinedBehaviorSanitizer and under ThreadSanitizer.

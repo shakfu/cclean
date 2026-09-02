@@ -128,7 +128,7 @@ cclean --no-defaults . "build/**"         # only what is named here
 |-|-|
 | `-n`, `--dry-run` | List matches and exit without removing |
 | `-b`, `--build-artifacts` | Also remove project build output (see below) |
-| `--dependencies` | Also remove marker-guarded dependency trees |
+| `-d`, `--dependencies` | Also remove marker-guarded dependency trees |
 | `-e`, `--exclude PATTERN` | Leave anything matching alone, contents included. Repeatable |
 | `-v`, `--verbose` | Name every item as it is removed |
 | `-y`, `--yes` | Remove without prompting |
