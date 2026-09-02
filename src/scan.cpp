@@ -174,9 +174,11 @@ void scan_tree(
                 const bool artifact = options.build_artifacts && is_directory &&
                     is_artifact_directory(path, filename, root,
                                           options.project_roots);
+                std::string restore;
                 const bool dependency = options.dependencies && is_directory &&
                     is_dependency_directory(path, filename,
-                                            options.dependency_markers);
+                                            options.dependency_markers,
+                                            &restore);
 
                 if (matched == nullptr && !artifact && !dependency) {
                     // Symlinks are never followed, so only a real directory is
@@ -211,6 +213,7 @@ void scan_tree(
                     target.reason = Reason::BuildArtifact;
                 } else if (dependency) {
                     target.reason = Reason::Dependency;
+                    target.restore = std::move(restore);
                 } else {
                     target.reason = matched->reason();
                 }
@@ -481,6 +484,7 @@ ScanResult scan(
     const ProgressFn& progress)
 {
     ScanResult result;
+    result.root = root;
 
     scan_tree(root, options, result, progress);
     size_directories(result, progress);

@@ -6,15 +6,35 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ### Added
 
+- `--config FILE` and `--no-config`. The upward search for `.cclean.toml` does not stop at the project, so a file in a home directory supplied `patterns`, `build_artifacts`, `dependencies` and `skip_protected` to every run beneath it, with nothing in the output naming the file responsible -- and `skip_protected = false` in a forgotten ancestor turned off the protection on `.git`, `.ssh` and `.gnupg` for every run after it. Neither of the new options depends on what sits above the checkout, which is what a scripted or CI run needs. `--verbose` now names the file a run used, and JSON output carries it as `config`.
+
+- The command that restores a dependency tree, printed beside the target and carried as `restore` in JSON: `uv sync`, `npm ci`, `yarn install --immutable`, `pnpm install --frozen-lockfile`, `bun install --frozen-lockfile`, `go mod vendor`. It was documented in the README and nowhere the user would see it while deciding whether to confirm the removal of something only the network can rebuild. It is now a field of the built-in table, so a new row cannot be added without answering the question. A pair configured through `dependency_markers` carries none: only the user knows what puts it back.
+
+- Exit status 3, for a run that completed with warnings. Status 1 was a root that could not be read, a directory the walk could not descend, and a removal that failed, all at once, so a script could not tell "cleaned everything, but one directory was unreadable" from "tried to delete and could not" -- a distinction the JSON document has always made. 1 now belongs to the failures.
+
+- A note on standard error when an operand that names a directory is read as a pattern. `ROOT` is one directory and everything after it is a glob, so `cclean a b` scans `a` and silently turns `b` into a pattern; the same rule makes `cclean projects/api build` match every `build` under that root, without the marker file and the `.git` that `--build-artifacts` requires. It is a note rather than an error because the same shape is documented use: `cclean . node_modules` is how the README says to remove a tree the dependency rules will not.
+
+- `"schema": 1` in the JSON document, so a consumer can refuse a shape it does not know rather than read a renamed field as a missing one.
+
 - `-d` as a short form of `--dependencies`, matching the short options the other mode flags already carry.
+
+- `remove_targets()`, which removes a reviewed list across the same worker pool the scan uses, and which the frontend now calls instead of looping over `remove_target()`. Removal is one `unlinkat` per entry and was the entire cost of a run: over a 134,400-file tree with 2,400 targets, the walk, the sizing and the sort took 30 ms together while removing them took 940 ms, so every previous round of parallel tuning had gone into 3% of the wall clock. The same run now takes 270 ms, which is what `xargs -P8 rm -rf` reaches over the same targets. The unit of work is one target rather than one directory level as it is when sizing: emptying a single target across threads means passing a directory descriptor between them and unlinking the directory only once every worker below it has finished, which the flat work queue cannot express and which this path, where the descriptor discipline is the safety property, is the wrong place to try. Results stay in the order the list was reviewed in, so neither the failure lines nor a `--verbose` log depends on which worker drew which target.
 
 - `libcclean`, a static library holding everything that finds, sizes and removes, with `cclean` reduced to a frontend over it. `make install` now installs `lib/libcclean.a` and the headers under `include/cclean/` beside the binary. The entry point is `scan()`, which walks a root, sizes matched directories, applies the age and size filters, and returns the targets sorted by path; `remove_target()` is the deletion boundary. The library touches no terminal, prints nothing of its own, and reads no environment variable.
 
 - A CI workflow: GCC and Clang on Linux and Clang on macOS, and both suites under AddressSanitizer with UndefinedBehaviorSanitizer and under ThreadSanitizer.
 
-- Regression coverage for everything below: numeric limits at zero, at the maximum, and one past it; marker directories, FIFOs, symlinks, broken symlinks, and `.git` as a file; symlink timestamps; filenames containing newlines, escape sequences, and invalid UTF-8; malformed and duplicated configuration keys; and the terminal confirmation branch, driven through a pseudo-terminal. The suites go from 178 to 309 unit checks and from 136 to 175 command-line checks; 171 of the latter run under root, which cannot be denied the permissions two of them need.
+- Regression coverage for everything below: numeric limits at zero, at the maximum, and one past it; marker directories, FIFOs, symlinks, broken symlinks, and `.git` as a file; symlink timestamps; filenames containing newlines, escape sequences, and invalid UTF-8; malformed and duplicated configuration keys; and the terminal confirmation branch, driven through a pseudo-terminal. The suites go from 178 to 323 unit checks and from 136 to 196 command-line checks; all but four of the latter run under root, which cannot be denied the permissions two of them need.
 
 ### Changed
+
+- A target's `type` in JSON output is `directory`, `file` or `symlink`, where it was only the first two. A symlink is not a kind of file here: it is unlinked without being followed and counts as zero bytes, so a consumer summing sizes or re-checking a path before acting on the document could not see the one distinction that changes what a removal means.
+
+- `remove_target()` takes the root the scan was given, since resolving a target one component at a time from a known directory is what the fix above needs. A target that is not at or below that root is refused rather than reached through `..`.
+
+- `ScanResult` carries the root it was scanned with, and `remove_targets(result)` is the form to prefer: it is the one call that cannot pair a result with the wrong root. `remove_targets(root, targets)` remains for a caller removing a list it filtered or built itself. `write_json()` reads the root from the result rather than taking it again, so there is one source of truth for it rather than two that can disagree.
+
+- CI promotes warnings to errors. The build job's comment said it already did; nothing in the repository set `-Werror`. It is set on the CI configure line rather than in `CMakeLists.txt`, so a new compiler version still cannot break an ordinary local build.
 
 - The program is split into `include/cclean` and `src` for the library, `cli` for the frontend, and one module per concern rather than a single 2,900-line translation unit. Command-line output is byte-identical across the flag, config, JSON, filter and error paths. The reason a target reports is carried on the pattern that matched it, replacing index arithmetic against two running counts that every caller had to keep in step with the order the patterns were built in. The unit suite links the library instead of including its source and renaming `main`.
 
@@ -31,6 +51,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The README states the contracts these changes settle: the accepted configuration subset rather than an implication of full TOML, how filenames are escaped in each output format, that a symlink is filtered on its own timestamp, and how deletion resolves a path.
 
 ### Fixed
+
+- The no-follow property of the deletion path stopped at the target's parent. That directory was opened by its whole path, which resolved every component by name after the scan had listed them and before the identity check could mean anything, so an interior directory replaced by a symlink in that window sent the removal wherever the link pointed -- while every open below the parent already refused to follow one. Reproduced by calling `remove_target()` with a target under a symlinked interior component: the file outside the tree was removed and the call reported success. Every component from the root down is now opened with `O_NOFOLLOW` through the descriptor above it, and a component that has become a symlink is named as such rather than reported as "Not a directory". The root itself is still opened by name and followed, because the user typed it. It costs nothing measurable: a run over the benchmark tree takes the same 270 ms it did before the walk.
 
 - The pseudo-terminal test driver reads the pty continuously instead of sleeping before it answers, which deadlocked `make test` on macOS. `tcsetattr(TCSAFLUSH)` drains output first, and on a pty that blocks until the master reads; the keypress written during that window was queued, then discarded by the same call, and the program waited on an answer that no longer existed. The driver also has a deadline, so a real regression fails rather than hangs.
 

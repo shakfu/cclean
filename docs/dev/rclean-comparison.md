@@ -15,16 +15,17 @@ This third revision (2026-08-31) updates the feature comparison for cclean 0.2.0
 | | cclean | rclean |
 |-|-|-|
 | Language | C++17, `libcclean` plus a CLI frontend | Rust, `src/` plus `tests/` |
-| Source | 3647 lines (2782 library, 865 frontend), plus 1956 of tests | 1487 lines, plus 1188 of tests |
+| Source | 4007 lines (3012 library, 995 frontend), plus 2215 of tests | 1487 lines, plus 1188 of tests |
 | Dependencies | none | 12 runtime, 2 dev |
 | Binary, stripped* | 93,680 bytes | 1,470,880 bytes |
 | Clean build* | 1.1 s | 17.9 s |
-| Automated tests | 26 unit functions (309 checks), 175 CLI checks | 69 tests |
+| Automated tests | 28 unit functions (323 checks), 196 CLI checks | 69 tests |
 | Dry run, 65,101 entries* | 61 ms | 78 ms |
 | Tree walk | parallel | parallel |
 | Directory sizing | parallel | parallel |
+| Removal | parallel, one target per worker | serial |
 | Protected directories | yes, fixed list, prunable with `--exclude` | yes, replaceable list |
-| Config file | `.cclean.toml`, upward from `ROOT` | `.rclean.toml`, plus `~/.config/rclean/` |
+| Config file | `.cclean.toml`, upward from `ROOT`, or named with `--config` | `.rclean.toml`, plus `~/.config/rclean/` |
 | Presets | none | 7, plus `all` |
 
 \* Measured against cclean 0.1.1 on 2026-08-29; not retaken for 0.2.0. cclean has roughly doubled in source size since, so treat the size and build-time rows as a floor.

@@ -20,9 +20,11 @@
 
 - [x] **Monorepo project roots**: `.cclean.toml` can list explicit `project_roots` relative to `ROOT`, allowing marker-guarded artifact detection without weakening nested-repository protection.
 
-- [x] **Unreadable directories are reported**: permission failures become warnings and return status 1.
+- [x] **Unreadable directories are reported**: permission failures become warnings and return status 3, which is theirs alone; status 1 is a root that cannot be read or a removal that failed.
 
-- [x] **Atomic pre-delete validation**: the parent directory is opened once, the type check runs against that descriptor, and every removal names an entry within a directory descriptor opened `O_NOFOLLOW`, so a path re-resolved between the check and the removal can no longer point somewhere else.
+- [x] **Atomic pre-delete validation**: every component from `ROOT` down is opened `O_NOFOLLOW` through the descriptor above it, the type check runs against the descriptor the walk ends on, and every removal names an entry within a directory descriptor, so a path re-resolved between the check and the removal can no longer point somewhere else. `ROOT` itself is opened by name, because the user typed it.
+
+- [x] **Configuration can be pinned or switched off**: the upward search does not stop at the project, so `--config FILE` names the file to read and `--no-config` reads none. `--verbose` and the JSON document name the file a run used.
 
 - [ ] **`ROOT` is exempt from the protected list**: pointing cclean at `.git` scans it. Deliberate, in that naming a directory is explicit, but inconsistent with the same name being protected during a walk.
 

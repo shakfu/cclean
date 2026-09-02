@@ -48,8 +48,8 @@ check() {
 
 # Root holds DAC_OVERRIDE and DAC_READ_SEARCH, so a directory made unreadable
 # or unwritable still denies it nothing: the checks that set those bits get
-# neither a warning nor a failed removal. Both assert exit status 1, so under
-# root they report a failure rather than testing anything.
+# neither a warning nor a failed removal. Both assert a non-zero exit status,
+# so under root they report a failure rather than testing anything.
 unprivileged() {
     [ "$(id -u)" -ne 0 ]
 }
@@ -380,8 +380,10 @@ check "--yes removes targets" 2 "$(count_files "$d")"
 check "--yes does not prompt" 0 "$(grep -c 'Permanently remove' "$json")"
 check "JSON reports removal" 1 "$(grep -c '\"status\": \"removed\"' "$json")"
 
-# A scan warning sets exit 1 but must not relabel a dry run as a failed
-# removal: status reports the action, warnings are their own array.
+# A scan warning has its own exit status, 3, so a script can tell it from the
+# failed removal that used to share status 1 with it. It must also not relabel
+# a dry run as a failed removal: status reports the action, warnings are their
+# own array.
 if unprivileged; then
     d=$WORK/json_warn
     rm -rf "$d"
@@ -389,7 +391,7 @@ if unprivileged; then
     printf 'x' > "$d/ok/a.pyc"
     chmod 000 "$d/locked"
     "$CCLEAN" -n --format json "$d" >"$json" 2>/dev/null
-    check "scan warning exits 1" 1 $?
+    check "scan warning exits 3" 3 $?
     check "warning keeps the dry-run status" 1 \
           "$(grep -c '\"status\": \"dry-run\"' "$json")"
     check "warning is reported in the JSON" 1 \
@@ -995,6 +997,108 @@ PTY_DRIVER
     check "the run completes through a terminal" 1 \
           "$(pty_answer "$d" y 2>/dev/null | grep -c 'Removed')"
 fi
+
+# --------------------------------------------------- config selection
+#
+# The upward search does not stop at the project, so a .cclean.toml in a home
+# directory reaches every run beneath it. --config names the file outright and
+# --no-config reads none, which is also what makes a run reproducible in CI.
+
+d=$WORK/config_select
+rm -rf "$d"
+mkdir -p "$d/nested/pkg"
+printf 'x' > "$d/nested/pkg/keep.tmp"
+printf 'patterns = ["*.tmp"]\n' > "$d/.cclean.toml"
+printf 'patterns = ["*.nomatch"]\n' > "$WORK/other.toml"
+
+check "discovered config applies" 1 \
+      "$("$CCLEAN" -n "$d/nested" | grep -c 'keep.tmp')"
+check "--no-config ignores the discovered file" 0 \
+      "$("$CCLEAN" -n --no-config "$d/nested" | grep -c 'keep.tmp')"
+check "--config replaces the discovered file" 0 \
+      "$("$CCLEAN" -n --config "$WORK/other.toml" "$d/nested" | \
+         grep -c 'keep.tmp')"
+check "--config=FILE is the same option" 0 \
+      "$("$CCLEAN" -n --config="$WORK/other.toml" "$d/nested" | \
+         grep -c 'keep.tmp')"
+
+"$CCLEAN" -n --config "$WORK/missing.toml" "$d" >/dev/null 2>&1
+check "--config on a missing file exits 2" 2 $?
+"$CCLEAN" -n --config "$WORK/other.toml" --no-config "$d" >/dev/null 2>&1
+check "--config with --no-config exits 2" 2 $?
+
+# Which file supplied the settings is otherwise invisible.
+check "--verbose names the config" 1 \
+      "$("$CCLEAN" -n -v "$d/nested" 2>&1 >/dev/null | \
+         grep -c 'Configuration: .*\.cclean\.toml')"
+check "--no-config names nothing" 0 \
+      "$("$CCLEAN" -n -v --no-config "$d/nested" 2>&1 >/dev/null | \
+         grep -c 'Configuration:')"
+
+# ------------------------------------------------- second root as a pattern
+#
+# ROOT is one directory and everything after it is a pattern, so a second path
+# is read as a glob. It stays legal -- `cclean . node_modules` is documented --
+# but it is said out loud, on stderr, before the list is confirmed.
+
+d=$WORK/second_root
+rm -rf "$d"
+mkdir -p "$d/a/__pycache__" "$d/b"
+printf 'x' > "$d/a/__pycache__/m.pyc"
+
+check "a second directory operand is noted" 1 \
+      "$("$CCLEAN" -n "$d/a" "$d/b" 2>&1 >/dev/null | grep -c 'not as a second root')"
+check "the note does not reach stdout" 0 \
+      "$("$CCLEAN" -n "$d/a" "$d/b" 2>/dev/null | grep -c 'second root')"
+check "a name existing under ROOT is noted" 1 \
+      "$("$CCLEAN" -n "$d" b 2>&1 >/dev/null | grep -c 'not as a second root')"
+check "a wildcard pattern is not noted" 0 \
+      "$("$CCLEAN" -n "$d" 'b*' 2>&1 >/dev/null | grep -c 'not as a second root')"
+check "a pattern naming nothing is not noted" 0 \
+      "$("$CCLEAN" -n "$d" zzz 2>&1 >/dev/null | grep -c 'not as a second root')"
+
+# ------------------------------------------------------ restore commands
+#
+# A dependency tree is the one target a user cannot put back without help, so
+# the command that does it is reported beside the size, before confirming.
+
+d=$WORK/restore
+rm -rf "$d"
+mkdir -p "$d/js/node_modules" "$d/go/vendor" "$d/conf/deps"
+printf 'x' > "$d/js/package-lock.json"
+printf 'x' > "$d/go/go.mod"
+printf 'x' > "$d/conf/mix.exs"
+printf 'dependency_markers = [["deps", "mix.exs"]]\n' > "$d/.cclean.toml"
+
+check "npm ci is reported for a locked node_modules" 1 \
+      "$("$CCLEAN" -n -d "$d" | grep -c 'node_modules/.*restore: npm ci')"
+check "go mod vendor is reported for a vendor tree" 1 \
+      "$("$CCLEAN" -n -d "$d" | grep -c 'vendor/.*restore: go mod vendor')"
+# A configured pair carries no restore command: only the user knows it.
+check "a configured pair reports no restore" 0 \
+      "$("$CCLEAN" -n -d "$d" | grep -c 'deps/.*restore')"
+check "the JSON carries the restore command" 1 \
+      "$("$CCLEAN" -n -d --format json "$d" | grep -c '"restore": "npm ci"')"
+
+# ---------------------------------------------------------- JSON contract
+
+d=$WORK/json_shape
+rm -rf "$d"
+mkdir -p "$d/pkg"
+printf 'x' > "$d/pkg/m.pyc"
+ln -s /nonexistent "$d/dangling.pyc"
+
+check "the document reports its schema" 1 \
+      "$("$CCLEAN" -n --format json "$d" | grep -c '"schema": 1')"
+# A matched symlink is unlinked without being followed and frees no contents,
+# which is exactly why a consumer must be able to tell it from a file.
+check "a symlink reports its own type" 1 \
+      "$("$CCLEAN" -n --format json "$d" | \
+         grep -c 'dangling.pyc", "type": "symlink"')"
+check "a file still reports file" 1 \
+      "$("$CCLEAN" -n --format json "$d" | grep -c '"type": "file"')"
+check "config is null when none was read" 1 \
+      "$("$CCLEAN" -n --format json --no-config "$d" | grep -c '"config": null')"
 
 # ------------------------------------------------------------------ result
 

@@ -9,6 +9,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "parallel.hpp"
+
 namespace cclean {
 
 namespace {
@@ -48,6 +50,93 @@ bool read_directory(
     }
 
     return ok;
+}
+
+// Opens the directory holding `relative`, one component at a time from `root`,
+// refusing to follow a symlink at any of them. Returns -1 with `error` set.
+//
+// Resolving the parent's whole path in one open() instead is a second lookup of
+// every component, made after the scan listed them and before the identity
+// check below can mean anything: an interior directory replaced by a symlink in
+// that window sent the removal wherever the link pointed, which was reachable
+// even though every open beneath the parent already refused to follow one. The
+// walk closes that by descending only through descriptors it has opened itself.
+//
+// `root` is the one component opened by name and followed, because the user
+// typed it; everything below it came from the scan.
+int open_parent(
+    const fs::path& root,
+    const fs::path& relative,
+    std::string& error)
+{
+    int parent = ::open(root.empty() ? "." : root.c_str(),
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+    if (parent < 0) {
+        error = errno_message(root.empty() ? fs::path(".") : root);
+        return -1;
+    }
+
+    fs::path walked = root;
+
+    // Everything but the final component, which is the target itself.
+    for (auto it = relative.begin(), last = --relative.end();
+         it != last; ++it) {
+        const std::string component = it->string();
+
+        // lexically_relative() produces ".." for a target that is not under
+        // root at all, and "." for a trailing separator. Neither can be walked
+        // through safely, and both mean the caller passed a root the target
+        // does not belong to.
+        if (component.empty() || component == "." || component == "..") {
+            error = "Target is not below the root it was found in: " +
+                    (root / relative).string();
+            ::close(parent);
+            return -1;
+        }
+
+        walked /= component;
+
+        const int next = ::openat(parent, component.c_str(),
+                                  O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                  O_CLOEXEC);
+
+        if (next < 0) {
+            const int open_errno = errno;
+
+            if (open_errno == ENOENT) {
+                error = "Target changed or disappeared: " +
+                        (root / relative).string();
+                return -1;
+            }
+
+            // O_NOFOLLOW reports a symlink as ELOOP or, with O_DIRECTORY, as
+            // ENOTDIR, which is also what an ordinary file gives. Which of the
+            // two it was is the whole point of the refusal, so it is worth one
+            // more syscall to say so: a component that was a directory during
+            // the scan and is a symlink now is the case this walk exists for.
+            struct stat info;
+
+            if ((open_errno == ELOOP || open_errno == ENOTDIR) &&
+                ::fstatat(parent, component.c_str(), &info,
+                          AT_SYMLINK_NOFOLLOW) == 0 &&
+                S_ISLNK(info.st_mode)) {
+                error = "Path component is now a symlink, refusing to follow "
+                        "it: " + walked.string();
+            } else {
+                errno = open_errno;
+                error = errno_message(walked);
+            }
+
+            ::close(parent);
+            return -1;
+        }
+
+        ::close(parent);
+        parent = next;
+    }
+
+    return parent;
 }
 
 // One descriptor and one stack frame are held per level, for as long as the
@@ -139,26 +228,23 @@ bool remove_entry_at(
 
 }  // namespace
 
-bool remove_target(const Target& target, std::string& error) {
-    const fs::path parent_path = target.path.parent_path();
+bool remove_target(
+    const fs::path& root,
+    const Target& target,
+    std::string& error)
+{
+    const fs::path relative = target.path.lexically_relative(root);
     const std::string name = target.path.filename().string();
 
-    if (name.empty() || name == "." || name == "..") {
+    if (name.empty() || name == "." || name == ".." || relative.empty() ||
+        relative == ".") {
         error = "Target is not a removable entry: " + target.path.string();
         return false;
     }
 
-    // No O_NOFOLLOW on this one: ROOT itself may legitimately have been reached
-    // through a symlinked path, and the user named it. Every open below ROOT,
-    // where the names come from the scan rather than from the user, refuses to
-    // follow one.
-    const int parent = ::open(parent_path.empty() ? "." : parent_path.c_str(),
-                              O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const int parent = open_parent(root, relative, error);
 
     if (parent < 0) {
-        error = errno == ENOENT
-            ? "Target changed or disappeared: " + target.path.string()
-            : errno_message(parent_path);
         return false;
     }
 
@@ -185,6 +271,44 @@ bool remove_target(const Target& target, std::string& error) {
     const bool ok = remove_entry_at(parent, name, target.path, error);
     ::close(parent);
     return ok;
+}
+
+std::vector<RemovalResult> remove_targets(
+    const fs::path& root,
+    const std::vector<Target>& targets)
+{
+    std::vector<RemovalResult> results(targets.size());
+
+    if (targets.empty()) {
+        return results;
+    }
+
+    // The queue is popped from the back, so the indices go in reversed: a run
+    // that ends up on one thread then removes in the order the list was
+    // reviewed in, which is what a --verbose log reads best in.
+    std::vector<std::size_t> queue;
+    queue.reserve(targets.size());
+
+    for (std::size_t i = targets.size(); i-- > 0;) {
+        queue.push_back(i);
+    }
+
+    // Each worker writes one distinct element of `results` and touches nothing
+    // else, so there is no lock here and no merge afterwards. `children` stays
+    // empty: a target is a leaf of this queue, whatever it holds underneath.
+    parallel_directories(
+        std::move(queue),
+        [&](std::size_t index, std::vector<std::size_t>&) {
+            RemovalResult& result = results[index];
+            result.removed =
+                remove_target(root, targets[index], result.error);
+        });
+
+    return results;
+}
+
+std::vector<RemovalResult> remove_targets(const ScanResult& result) {
+    return remove_targets(result.root, result.targets);
 }
 
 }  // namespace cclean

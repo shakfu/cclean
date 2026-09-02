@@ -38,6 +38,12 @@ struct ScanOptions {
 };
 
 struct ScanResult {
+    // The root the walk was given, verbatim. Every target's path is built from
+    // it, and removal resolves a target by descending from it one component at
+    // a time, so the two have to be the same form: keeping it here is what
+    // stops a caller from pairing a result with the wrong root.
+    fs::path root;
+
     // Sorted by path. Directory iteration order is unspecified, and this list
     // is what a user reviews before confirming a permanent deletion.
     std::vector<Target> targets;

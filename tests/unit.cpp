@@ -925,6 +925,158 @@ void test_parallel_scan_propagates_exceptions() {
     CHECK_EQ(total.load(), 64);
 }
 
+// ------------------------------------------------------ parallel removal
+
+// remove_targets() spreads the targets across the worker pool, so the contract
+// that matters to a caller is that the results stay aligned with the list it
+// passed in: the frontend prints target[i] against result[i], and the matched
+// list is what the user reviewed. A failure must land in its own slot and
+// leave its neighbours alone.
+void test_remove_targets() {
+    group("remove_targets");
+
+    TempTree tree;
+
+    CHECK(remove_targets(tree.root(), {}).empty());
+
+    // Enough targets that several workers draw one, and each with contents, so
+    // the recursive path runs rather than a single unlink.
+    constexpr int count = 64;
+    std::vector<Target> targets;
+
+    for (int i = 0; i < count; ++i) {
+        const fs::path directory =
+            tree.root() / ("pkg" + std::to_string(i)) / "__pycache__";
+        fs::create_directories(directory / "nested");
+        std::ofstream(directory / "a.pyc") << "x";
+        std::ofstream(directory / "nested" / "b.pyc") << "x";
+
+        Target target;
+        target.path = directory;
+        target.is_directory = true;
+        targets.push_back(target);
+    }
+
+    // One target that cannot be removed, in the middle of the list: the name
+    // is not there at all, which fails the same way for an unprivileged user
+    // and for root.
+    Target missing;
+    missing.path = tree.root() / "pkg7" / "gone";
+    missing.is_directory = true;
+    targets.insert(targets.begin() + 32, missing);
+
+    const std::vector<RemovalResult> results =
+        remove_targets(tree.root(), targets);
+
+    CHECK_EQ(results.size(), targets.size());
+
+    bool aligned = true;
+
+    for (std::size_t i = 0; i < results.size(); ++i) {
+        const bool expected = targets[i].path != missing.path;
+
+        if (results[i].removed != expected) {
+            aligned = false;
+        }
+
+        // A message names its own target, never another worker's.
+        if (!results[i].removed &&
+            results[i].error.find(targets[i].path.string()) ==
+                std::string::npos) {
+            aligned = false;
+        }
+
+        // A successful removal says nothing.
+        if (results[i].removed && !results[i].error.empty()) {
+            aligned = false;
+        }
+    }
+
+    CHECK(aligned);
+
+    // Every target is gone from disk, not merely reported as removed.
+    int left = 0;
+
+    for (const Target& target : targets) {
+        if (fs::exists(target.path)) {
+            ++left;
+        }
+    }
+
+    CHECK_EQ(left, 0);
+
+    // The overload a caller should reach for: a result carries the root it was
+    // scanned with, so the two cannot be paired wrongly.
+    fs::create_directories(tree.root() / "again" / "__pycache__");
+    std::ofstream(tree.root() / "again" / "__pycache__" / "c.pyc") << "x";
+
+    ScanOptions options;
+    options.patterns = compile_patterns(true, {}, {});
+
+    const ScanResult scanned = scan(tree.root(), options);
+
+    CHECK_EQ(scanned.root, tree.root());
+    CHECK_EQ(scanned.targets.size(), std::size_t{1});
+    CHECK_EQ(remove_targets(scanned).size(), scanned.targets.size());
+    CHECK(!fs::exists(tree.root() / "again" / "__pycache__"));
+}
+
+// The no-follow property used to stop at the target's parent: that one open()
+// resolved every component of the path by name, after the scan had listed
+// them, so an interior directory replaced by a symlink in that window sent the
+// removal wherever the link pointed. Nothing below the parent could follow a
+// link, and it did not matter. This needs no race to test -- the substitution
+// is simply already in place.
+void test_remove_refuses_symlinked_parent() {
+    group("remove_target no-follow");
+
+    TempTree tree;
+    const fs::path root = tree.root();
+
+    fs::create_directories(root / "outside");
+    std::ofstream(root / "outside" / "secret.pyc") << "x";
+
+    fs::create_directories(root / "project" / "real");
+    std::ofstream(root / "project" / "real" / "cache.pyc") << "x";
+
+    // What the scan would have listed, had `sub` been a directory then.
+    fs::create_directory_symlink("../outside", root / "project" / "sub");
+
+    Target through_link;
+    through_link.path = root / "project" / "sub" / "secret.pyc";
+
+    std::string error;
+    CHECK(!remove_target(root, through_link, error));
+    CHECK(error.find("symlink") != std::string::npos);
+    // The refusal names the component that changed, not the target.
+    CHECK(error.find("sub") != std::string::npos);
+    CHECK(fs::exists(root / "outside" / "secret.pyc"));
+
+    // An ordinary target at the same depth is still removed.
+    Target ordinary;
+    ordinary.path = root / "project" / "real" / "cache.pyc";
+    CHECK(remove_target(root, ordinary, error));
+    CHECK(!fs::exists(ordinary.path));
+
+    // A target that is not below the root it is removed against is refused
+    // rather than reached through "..".
+    Target outside;
+    outside.path = root / "outside" / "secret.pyc";
+    CHECK(!remove_target(root / "project", outside, error));
+    CHECK(fs::exists(outside.path));
+
+    // The root itself is opened by name and may be a symlink: the user typed
+    // it, and the walk below it is what refuses to follow one.
+    fs::create_directory_symlink(root / "project", root / "link-to-project");
+    fs::create_directories(root / "project" / "keep");
+    std::ofstream(root / "project" / "keep" / "d.pyc") << "x";
+
+    Target under_symlinked_root;
+    under_symlinked_root.path = root / "link-to-project" / "keep" / "d.pyc";
+    CHECK(remove_target(root / "link-to-project", under_symlinked_root, error));
+    CHECK(!fs::exists(root / "project" / "keep" / "d.pyc"));
+}
+
 }  // namespace
 
 int main() {
@@ -954,6 +1106,8 @@ int main() {
     test_string_array_parsing();
     test_pair_array_parsing();
     test_parallel_scan_propagates_exceptions();
+    test_remove_targets();
+    test_remove_refuses_symlinked_parent();
 
     if (g_failures == 0) {
         std::printf("unit: %d checks passed\n", g_checks);

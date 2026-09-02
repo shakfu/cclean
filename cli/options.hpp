@@ -21,6 +21,9 @@ struct CommandLine {
 
     std::string older_than;
     std::string larger_than;
+    // Empty unless --config was given; `no_config` is --no-config.
+    std::string config_path;
+    bool no_config = false;
     std::vector<std::string> excludes;
 
     // ROOT, then any pattern. Never empty after a successful parse.

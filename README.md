@@ -65,21 +65,24 @@ options.larger_than = 1024u * 1024;
 
 const cclean::ScanResult result = cclean::scan("./project", options);
 
-for (const cclean::Target& target : result.targets) {
-    std::string error;
-    cclean::remove_target(target, error);
+for (const cclean::RemovalResult& removal : cclean::remove_targets(result)) {
+    if (!removal.removed) {
+        std::cerr << removal.error << '\n';
+    }
 }
 ```
 
 `scan()` walks the tree, sizes every matched directory, applies the age and size filters, and returns the targets sorted by path together with any paths it could not read. It takes an optional `ProgressFn`, called once per unit of work from the worker threads but serialised, so throttling is the caller's to decide.
 
+Removal resolves each target by descending from the root the scan was given, one component at a time, so it needs to know that root. A `ScanResult` carries it, which is why `remove_targets(result)` is the form to prefer: a result and a root cannot be mismatched. `remove_targets(root, targets)` and `remove_target(root, target, error)` take it explicitly, for a caller removing a list it filtered or built itself. A target must be at or below the root it is removed against; one that is not is refused rather than reached through `..`.
+
 The headers, each usable on its own:
 
 | Header | Contents |
 |-|-|
-| `cclean/scan.hpp` | `ScanOptions`, `ScanResult`, `scan()`, `compile_patterns()`, `compile_excludes()` |
+| `cclean/scan.hpp` | `ScanOptions`, `ScanResult` (which carries its root), `scan()`, `compile_patterns()`, `compile_excludes()` |
 | `cclean/target.hpp` | `Target` and the `Reason` it reports |
-| `cclean/remove.hpp` | `remove_target()`, the descriptor-relative deletion boundary |
+| `cclean/remove.hpp` | `remove_target()`, the descriptor-relative deletion boundary, and `remove_targets()`, which runs it across the pool |
 | `cclean/config.hpp` | `Config`, `find_config()`, `load_config()` |
 | `cclean/glob.hpp` | `Glob` and the two matching helpers |
 | `cclean/filters.hpp` | `parse_duration()`, `parse_size()`, `is_older_than()` |
@@ -133,6 +136,8 @@ cclean --no-defaults . "build/**"         # only what is named here
 | `-v`, `--verbose` | Name every item as it is removed |
 | `-y`, `--yes` | Remove without prompting |
 | `--format FORMAT` | Select `human` (default) or `json` output |
+| `--config FILE` | Read this configuration file instead of searching for one |
+| `--no-config` | Read no configuration file at all |
 | `--older-than DURATION` | Match only targets older than a duration (`s`, `m`, `h`, `d`, `w`) |
 | `--larger-than SIZE` | Match only targets of at least a size (`B`, `K`, `M`, `G`, `T`) |
 | `-h`, `--help` | Show usage |
@@ -143,7 +148,9 @@ cclean --no-defaults . "build/**"         # only what is named here
 
 ### Configuration
 
-cclean searches from `ROOT` upward for the first `.cclean.toml`. It does not read configuration from outside that ancestor chain. CLI options override configuration values. CLI exclude patterns replace configured excludes when at least one `--exclude` is supplied; command-line patterns are added after configured patterns.
+cclean searches from `ROOT` upward for the first `.cclean.toml`. It does not read configuration from outside that ancestor chain. CLI options override configuration values.
+
+The search does not stop at the project, so a `.cclean.toml` in a home directory is read by every run beneath it. `--config FILE` names the file to read instead, and `--no-config` reads none — the two forms a scripted or CI run wants, since neither depends on what sits above the checkout. `--verbose` names the file a run actually used, and JSON output carries it as `config`. CLI exclude patterns replace configured excludes when at least one `--exclude` is supplied; command-line patterns are added after configured patterns.
 
 The supported schema is deliberately small and rejects unknown keys, duplicate keys, and invalid values:
 
@@ -222,6 +229,8 @@ The directory must also be top-level in the outermost project. A submodule or a 
 | `node_modules/` | `bun.lock`, `bun.lockb` | `bun install --frozen-lockfile` |
 | `vendor/` | `go.mod` | `go mod vendor` |
 
+The restore command is part of the table rather than of this page: it is printed beside each dependency target in the matched list, and carried as `restore` in JSON output, because it is the one question worth answering before confirming the removal of a tree only the network can rebuild. A pair configured through `dependency_markers` carries none, since only you know what puts it back.
+
 The list is three ecosystems, not every ecosystem. A wrong entry deletes a tree that cannot be rebuilt, so it stays where the restore command is known and the layout is conventional. Other ecosystems are a pattern in `.cclean.toml`, which matches by name without a marker and so is the user's own judgement to make.
 
 Each marker is the file that pins versions, not the one that declares them. `uv.lock` rather than `pyproject.toml`, which poetry, pdm and hatch also write and which sits beside pip-populated virtualenvs. `package-lock.json` rather than `package.json`, which carries ranges: only the lock names a tree, and only `npm ci` reinstalls it exactly. `go.mod` needs no companion, because minimal version selection makes it deterministic on its own.
@@ -267,6 +276,8 @@ Command-line patterns are tested against the path relative to `ROOT` and against
 
 A matched directory is removed whole. Its contents are not searched again, and never appear as separate entries in the list.
 
+`ROOT` is one directory, and every operand after it is a pattern. `cclean a b` therefore scans `a` and reads `b` as a glob, rather than scanning both — and a bare name like `build` matches every directory of that name anywhere under `ROOT`, without the marker file and the `.git` that `--build-artifacts` requires before it will touch one. That is sometimes what you want, which is why `cclean . node_modules` is documented above, so a pattern that also names a directory is reported as a note on standard error rather than refused.
+
 ## Confirmation
 
 The prompt takes a single keypress, with no Enter. `y` or `Y` proceeds; anything else cancels, end of input included. Typed-ahead keystrokes are discarded, so a stray keypress from before the prompt cannot answer it.
@@ -284,7 +295,11 @@ Colour is used for directories, totals, and failures. It is disabled automatical
 
 The matched list is printed once. After confirmation you get a one-line summary; only failures are named again. `--verbose` restores the per-item log.
 
-`--format json` writes one JSON document to standard output. It includes the root, status, matched targets, logical byte totals, per-reason statistics, and warnings. Progress, prompts, and other diagnostics go to standard error. Each target includes a `reason`: `default`, `config`, `command-line`, `build-artifact`, or `dependency`.
+`--format json` writes one JSON document to standard output. It includes the root, the configuration file the run used (`config`, or `null`), status, matched targets, logical byte totals, per-reason statistics, and warnings. Progress, prompts, and other diagnostics go to standard error. Each target includes a `reason`: `default`, `config`, `command-line`, `build-artifact`, or `dependency`, and a dependency target also carries `restore`, the command that puts the tree back.
+
+A target's `type` is `directory`, `file` or `symlink`. A symlink is not a kind of file here: it is unlinked without being followed and counts as zero bytes, so a consumer summing sizes or re-checking a path before acting on it has to be able to tell the two apart.
+
+The document opens with `"schema": 1`, so a consumer can refuse a shape it does not know rather than read a renamed field as a missing one. The number changes when a field changes meaning or leaves, not when one is added.
 
 ### Filenames in output
 
@@ -299,8 +314,11 @@ In JSON output, the document is always valid UTF-8 and always parseable. Bytes t
 | Code | Meaning |
 |-|-|
 | 0 | Scan completed; removal succeeded, nothing matched, cancellation, or dry run |
-| 1 | `ROOT` cannot be inspected, a scan warning occurred, or a removal failed |
+| 1 | `ROOT` cannot be inspected, or a removal failed |
 | 2 | Bad option, invalid configuration, or no patterns left to match |
+| 3 | The run completed, but something could not be read and was reported as a warning |
+
+Status 3 used to be status 1. Sharing one code meant a script could not tell "cleaned everything, but one directory was unreadable" from "tried to delete and could not", though the JSON document has always separated the two.
 
 ## Sizes
 
@@ -316,9 +334,13 @@ The tree walk uses the same work queue, so listing directories is spread across 
 
 ## How deletion works
 
-Removal is descriptor-relative. The parent directory of a reviewed target is opened once, the entry is confirmed to still have the type it had when the list was shown, and every removal names an entry within a directory descriptor rather than re-resolving a path. Directories are emptied by opening each level with `O_NOFOLLOW` and unlinking within it, so a symlink substituted for a directory mid-run is an error rather than a way out of the tree, and a component renamed after the check cannot be reached by name at all.
+Removal is descriptor-relative from `ROOT` down. Each component of a reviewed target's path is opened with `O_NOFOLLOW`, one at a time, through the descriptor the component above it returned; the entry is then confirmed to still have the type it had when the list was shown, and every removal names an entry within a directory descriptor rather than re-resolving a path. Directories are emptied the same way. So a symlink substituted for a directory mid-run is an error rather than a way out of the tree, and a component renamed after the scan cannot be reached by name at all.
+
+`ROOT` itself is opened by name and followed, because you typed it and may have reached it through a symlink. Every name below it came from the scan, and none of them is followed.
 
 Symlinks are unlinked, never followed. A symlink matched as a target removes the link itself and leaves whatever it pointed at alone.
+
+Targets are removed in parallel, across the same worker pool the scan uses. Removal is one `unlinkat` per entry and is where a run spends its time: over a 134,400-file tree with 2,400 targets, the walk, the sizing and the sort took 30 ms together and removing them took 940 ms serially, against 270 ms for the whole run now. The unit of work is one target, so a run whose targets are one very large `node_modules` gains nothing — unlike sizing, which parallelizes a single target across directory levels. Results are reported in the order the list was shown in, whichever worker removed what.
 
 ## Limitations
 

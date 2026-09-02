@@ -47,10 +47,15 @@ bool is_artifact_directory(
 
 // Configured pairs take the same marker guard and the same --dependencies
 // gate as the built-ins, which is what separates them from a pattern.
+//
+// `restore`, when given, receives the command that puts a matched built-in
+// tree back -- `npm ci` for a node_modules beside a package-lock.json. It is
+// cleared for a configured pair, where only the user knows what restores it.
 bool is_dependency_directory(
     const fs::path& directory,
     const std::string& name,
-    const std::vector<std::pair<std::string, std::string>>& configured = {});
+    const std::vector<std::pair<std::string, std::string>>& configured = {},
+    std::string* restore = nullptr);
 
 // A member of defaults::skipped: never matched, never descended into.
 bool is_skipped(const std::string& name);

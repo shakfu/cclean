@@ -108,15 +108,25 @@ bool is_artifact_directory(
 bool is_dependency_directory(
     const fs::path& directory,
     const std::string& name,
-    const std::vector<std::pair<std::string, std::string>>& configured)
+    const std::vector<std::pair<std::string, std::string>>& configured,
+    std::string* restore)
 {
-    for (const defaults::Artifact& dependency : defaults::dependencies) {
+    if (restore != nullptr) {
+        restore->clear();
+    }
+
+    for (const defaults::Dependency& dependency : defaults::dependencies) {
         if (dependency.directory == name &&
             has_marker_file(directory.parent_path(), dependency.marker)) {
+            if (restore != nullptr) {
+                *restore = std::string(dependency.restore);
+            }
             return true;
         }
     }
 
+    // A configured pair carries no restore command: the user chose the pair,
+    // and only the user knows what puts the tree back.
     for (const auto& dependency : configured) {
         if (dependency.first == name &&
             has_marker_file(directory.parent_path(), dependency.second)) {

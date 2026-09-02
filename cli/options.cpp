@@ -26,6 +26,9 @@ void print_usage(const char* program) {
         << "  -v, --verbose  Name every item as it is removed\n"
         << "  -y, --yes      Remove without prompting\n"
         << "  --format FORMAT  Output human (default) or json\n"
+        << "  --config FILE  Read this configuration file instead of\n"
+        << "                 searching upward from ROOT\n"
+        << "  --no-config    Read no configuration file at all\n"
         << "  --older-than DURATION\n"
         << "                 Match only targets older than DURATION\n"
         << "                 (s, m, h, d, w)\n"
@@ -161,6 +164,27 @@ bool parse_command_line(
                 continue;
             }
 
+            if (argument == "--no-config") {
+                command_line.no_config = true;
+                continue;
+            }
+
+            if (argument == "--config") {
+                if (i + 1 >= argc) {
+                    std::cerr << argument << " needs a file.\n";
+                    status = 2;
+                    return false;
+                }
+
+                command_line.config_path = argv[++i];
+                continue;
+            }
+
+            if (argument.rfind("--config=", 0) == 0) {
+                command_line.config_path = argument.substr(9);
+                continue;
+            }
+
             if (argument == "--format") {
                 if (i + 1 >= argc) {
                     std::cerr << argument << " needs a format.\n";
@@ -222,6 +246,12 @@ bool parse_command_line(
         }
 
         command_line.operands.push_back(argument);
+    }
+
+    if (command_line.no_config && !command_line.config_path.empty()) {
+        std::cerr << "--config and --no-config cannot both be given.\n";
+        status = 2;
+        return false;
     }
 
     // No ROOT given means the working directory; --help is how usage is read.

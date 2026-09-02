@@ -10,9 +10,9 @@ namespace cclean {
 
 void write_json(
     std::ostream& out,
-    const fs::path& root,
     const ScanResult& result,
-    const Outcome& outcome)
+    const Outcome& outcome,
+    const fs::path& config)
 {
     std::uintmax_t total = 0;
     std::map<std::string, std::pair<std::size_t, std::uintmax_t>> stats;
@@ -40,7 +40,10 @@ void write_json(
     }
 
     out << "{\n"
-        << "  \"root\": " << json_string(root.string()) << ",\n"
+        << "  \"schema\": " << json_schema_version << ",\n"
+        << "  \"root\": " << json_string(result.root.string()) << ",\n"
+        << "  \"config\": "
+        << (config.empty() ? "null" : json_string(config.string())) << ",\n"
         << "  \"status\": " << json_string(status) << ",\n"
         << "  \"targets\": [";
 
@@ -49,12 +52,26 @@ void write_json(
         if (i != 0) {
             out << ',';
         }
+        const char* type = "file";
+
+        if (target.is_symlink) {
+            // Never "directory", even for a link to one: it is the link that
+            // is removed, and it frees no contents.
+            type = "symlink";
+        } else if (target.is_directory) {
+            type = "directory";
+        }
+
         out << "\n    {\"path\": " << json_string(target.path.string())
-            << ", \"type\": "
-            << json_string(target.is_directory ? "directory" : "file")
+            << ", \"type\": " << json_string(type)
             << ", \"bytes\": " << target.size
-            << ", \"reason\": " << json_string(reason_name(target.reason))
-            << "}";
+            << ", \"reason\": " << json_string(reason_name(target.reason));
+
+        if (!target.restore.empty()) {
+            out << ", \"restore\": " << json_string(target.restore);
+        }
+
+        out << "}";
     }
 
     out << "\n  ],\n"

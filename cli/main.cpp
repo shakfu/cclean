@@ -19,6 +19,13 @@ using namespace cclean::cli;
 
 namespace {
 
+// Exit 1 was every kind of trouble at once: a root that could not be read, a
+// directory the walk could not descend, and a removal that failed. A script
+// could not tell "cleaned everything, but one directory was unreadable" from
+// "tried to delete and could not", though the JSON document has always
+// separated them. Warnings keep their own status; 1 stays with the failures.
+constexpr int exit_warnings = 3;
+
 // A command-line value wins over the config file; the config file wins over
 // the built-in default. Whether the option appeared is what decides, not its
 // value, since false and "" are settings a user can mean.
@@ -118,7 +125,16 @@ void print_targets(const std::vector<Target>& targets,
         }
 
         std::cout << style.dim << "  " << format_size(target.size)
-                  << style.reset << '\n';
+                  << style.reset;
+
+        // The one question a user has when asked to confirm the removal of a
+        // tree only the network can rebuild.
+        if (!target.restore.empty()) {
+            std::cout << style.dim << "  restore: " << target.restore
+                      << style.reset;
+        }
+
+        std::cout << '\n';
     }
 
     std::cout << '\n'
@@ -126,6 +142,49 @@ void print_targets(const std::vector<Target>& targets,
               << (targets.size() == 1 ? " target, " : " targets, ")
               << style.bold << format_size(total_size) << style.reset
               << " to reclaim\n";
+}
+
+// ROOT is one directory and everything after it is a pattern, so `cclean a b`
+// scans `a` and turns `b` into a glob. That is quiet in both directions: a
+// second path the user meant as a root matches nothing and the run reports
+// success, and a bare name like `build` matches every directory of that name
+// anywhere under ROOT -- without the marker file and the .git that
+// --build-artifacts requires before it will touch one. Both are worth a line
+// before the list rather than after the deletion.
+//
+// It stays a note rather than an error because the same shape is a documented
+// use: `cclean . node_modules` is how the README says to remove a tree the
+// dependency rules will not.
+void note_directory_patterns(
+    const fs::path& root,
+    const std::vector<std::string>& patterns,
+    const Style& style)
+{
+    const auto is_directory = [](const fs::path& path) {
+        std::error_code ec;
+        return fs::is_directory(path, ec) && !ec;
+    };
+
+    for (const std::string& pattern : patterns) {
+        if (pattern.find_first_of("*?") != std::string::npos) {
+            continue;
+        }
+
+        // Two shapes of the same mistake: a path relative to here, which is a
+        // second root typed as one, and a name that exists directly under
+        // ROOT, which is the one that quietly matches every directory of that
+        // name further down.
+        if (!is_directory(pattern) && !is_directory(root / pattern)) {
+            continue;
+        }
+
+        std::cerr << style.warning << "Note:" << style.reset << " "
+                  << display(pattern) << " names a directory, and was read as "
+                     "a pattern, not as a second root.\n"
+                     "      It matches every entry called " << display(pattern)
+                  << " anywhere under " << display(root)
+                  << ". One root per run.\n";
+    }
 }
 
 }  // namespace
@@ -141,7 +200,27 @@ int main(int argc, char* argv[]) {
     const fs::path root(args.operands.front());
 
     Config config;
-    const fs::path config_path = find_config(root);
+
+    // --config names the file outright; --no-config reads none. Without
+    // either, the search runs upward from ROOT and does not stop at the
+    // project, so a .cclean.toml in a home directory reaches every run
+    // beneath it -- which is the reason both of these exist.
+    fs::path config_path;
+
+    if (!args.no_config) {
+        if (!args.config_path.empty()) {
+            config_path = args.config_path;
+
+            std::error_code config_ec;
+            if (!fs::is_regular_file(config_path, config_ec) || config_ec) {
+                std::cerr << "Config file is not a readable file: "
+                          << args.config_path << '\n';
+                return 2;
+            }
+        } else {
+            config_path = find_config(root);
+        }
+    }
 
     if (!config_path.empty()) {
         std::string config_error;
@@ -149,6 +228,12 @@ int main(int argc, char* argv[]) {
         if (!load_config(config_path, config, config_error)) {
             std::cerr << config_error << '\n';
             return 2;
+        }
+
+        // Which file supplied the settings is otherwise invisible, and the
+        // upward search means it may be one the user has forgotten about.
+        if (args.verbose) {
+            std::cerr << "Configuration: " << display(config_path) << '\n';
         }
     }
 
@@ -251,12 +336,13 @@ int main(int argc, char* argv[]) {
 
     if (result.targets.empty()) {
         if (args.format_json) {
-            write_json(std::cout, root, result, {args.dry_run, false, 0, 0});
+            write_json(std::cout, result, {args.dry_run, false, 0, 0},
+                       config_path);
         } else {
             std::cout << "No matching targets found.\n";
         }
 
-        return result.warnings.empty() ? 0 : 1;
+        return result.warnings.empty() ? 0 : exit_warnings;
     }
 
     std::uintmax_t total_size = 0;
@@ -265,19 +351,22 @@ int main(int argc, char* argv[]) {
         total_size = saturating_add(total_size, target.size);
     }
 
+    note_directory_patterns(root, cli_patterns, err);
+
     if (!args.format_json) {
         print_targets(result.targets, total_size, out);
     }
 
     if (args.dry_run) {
         if (args.format_json) {
-            write_json(std::cout, root, result, {true, false, 0, 0});
+            write_json(std::cout, result, {true, false, 0, 0},
+                       config_path);
         } else {
             std::cout << out.dim << "Dry run: nothing was removed."
                       << out.reset << '\n';
         }
 
-        return result.warnings.empty() ? 0 : 1;
+        return result.warnings.empty() ? 0 : exit_warnings;
     }
 
     bool go_ahead = args.assume_yes;
@@ -302,38 +391,45 @@ int main(int argc, char* argv[]) {
 
     if (!go_ahead) {
         if (args.format_json) {
-            write_json(std::cout, root, result, {false, true, 0, 0});
+            write_json(std::cout, result, {false, true, 0, 0},
+                       config_path);
         } else {
             std::cout << "Cancelled.\n";
         }
 
-        return result.warnings.empty() ? 0 : 1;
+        return result.warnings.empty() ? 0 : exit_warnings;
     }
 
     Outcome outcome;
 
+    // Removing is unlinkat per entry and is where a run spends its time; the
+    // targets are independent, so they go through the same pool the scan uses.
+    // The results come back in the order the list was shown in, so what is
+    // printed below does not depend on which worker drew which target.
+    const std::vector<RemovalResult> removals = remove_targets(result);
+
     // The matched list was already shown, so only failures are named again.
     // --verbose restores the per-item log.
-    for (const Target& target : result.targets) {
-        std::string removal_error;
+    for (std::size_t i = 0; i < removals.size(); ++i) {
+        const RemovalResult& removal = removals[i];
 
-        if (!remove_target(target, removal_error)) {
+        if (!removal.removed) {
             ++outcome.failed;
-            result.warnings.push_back(removal_error);
+            result.warnings.push_back(removal.error);
             std::cerr << "  " << err.failure << "failed" << err.reset << "  "
-                      << display(removal_error) << '\n';
+                      << display(removal.error) << '\n';
         } else {
             ++outcome.removed;
 
             if (args.verbose && !args.format_json) {
                 std::cout << "  " << out.dim << "removed" << out.reset << "  "
-                          << display(target.path) << '\n';
+                          << display(result.targets[i].path) << '\n';
             }
         }
     }
 
     if (args.format_json) {
-        write_json(std::cout, root, result, outcome);
+        write_json(std::cout, result, outcome, config_path);
     } else if (outcome.failed == 0) {
         std::cout << out.success << "Removed " << outcome.removed << out.reset
                   << ", " << format_size(total_size) << " reclaimed\n";
@@ -347,5 +443,5 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    return result.warnings.empty() ? 0 : 1;
+    return result.warnings.empty() ? 0 : exit_warnings;
 }
