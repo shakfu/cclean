@@ -72,6 +72,15 @@ count_files() {
     find "$1" -type f 2>/dev/null | wc -l | tr -d ' '
 }
 
+# Reads a stream and answers whether any escape sequence reached it.
+coloured() {
+    if grep -q "$(printf '\033')"; then
+        echo yes
+    else
+        echo no
+    fi
+}
+
 echo "cli: running"
 
 # ---------------------------------------------------------------- dry run
@@ -144,6 +153,37 @@ check "default output does not list removals" 0 "$quiet_lines"
 d=$(fixture verbose_on)
 loud_lines=$(printf 'y' | "$CCLEAN" --verbose "$d" | grep -c 'removed ')
 check "verbose lists each removal" 3 "$loud_lines"
+
+# The grand total says how much, not how much of what: a dependency tree needs
+# the network to come back and a cache does not. The breakdown the JSON has
+# always carried as `stats` is printed under the total.
+d=$WORK/reasons
+rm -rf "$d"
+mkdir -p "$d/.git" "$d/build" "$d/node_modules/pkg" "$d/pkg/__pycache__" \
+         "$d/.pytest_cache"
+printf 'x' > "$d/CMakeLists.txt"
+printf 'x' > "$d/package-lock.json"
+printf 'aaaa' > "$d/pkg/__pycache__/a.pyc"
+printf 'bbbb' > "$d/.pytest_cache/entry"
+printf 'c' > "$d/tmp.log"
+printf 'dd' > "$d/build/out"
+printf 'eee' > "$d/node_modules/pkg/index.js"
+
+# Echoes "COUNT SIZE UNIT" from the summary row for one reason.
+reason_row() {
+    "$CCLEAN" -n -b -d "$d" "*.log" | awk -v r="$1" '$1 == r {print $2, $3, $4}'
+}
+
+check "summary counts default targets" "2 8 B" "$(reason_row default)"
+check "summary counts command-line targets" "1 1 B" "$(reason_row command-line)"
+check "summary counts build artifacts" "1 2 B" "$(reason_row build-artifact)"
+check "summary counts dependencies" "1 3 B" "$(reason_row dependency)"
+check "summary rows account for the total" "5 targets, 14 B to reclaim" \
+      "$("$CCLEAN" -n -b -d "$d" "*.log" | grep 'to reclaim')"
+
+# A single reason makes the breakdown the total line again.
+check "one reason prints no breakdown" 0 \
+      "$("$CCLEAN" -n "$d/pkg" | grep -c '^  default')"
 
 # ----------------------------------------------------------- configuration
 
@@ -408,6 +448,19 @@ check "--help exits 0" 0 $?
 
 "$CCLEAN" --bogus >/dev/null 2>&1
 check "unknown option exits 2" 2 $?
+
+# Usage that was asked for is output, so `cclean --help | less` shows it.
+# Usage that follows a rejected argument is a diagnostic and stays on stderr.
+"$CCLEAN" --help >"$WORK/help.out" 2>"$WORK/help.err"
+check "--help writes usage to stdout" 1 "$(grep -c '^Usage:' "$WORK/help.out")"
+check "--help writes nothing to stderr" 0 \
+      "$(wc -c < "$WORK/help.err" | tr -d ' ')"
+
+"$CCLEAN" --bogus >"$WORK/bogus.out" 2>"$WORK/bogus.err"
+check "unknown option writes usage to stderr" 1 \
+      "$(grep -c '^Usage:' "$WORK/bogus.err")"
+check "unknown option writes nothing to stdout" 0 \
+      "$(wc -c < "$WORK/bogus.out" | tr -d ' ')"
 
 "$CCLEAN" --version >/dev/null 2>&1
 check "--version exits 0" 0 $?
@@ -708,6 +761,23 @@ check "no progress when stderr is a file" 0 "$(wc -c < "$WORK/err.txt" | tr -d '
 check "NO_COLOR is honoured" 0 \
       "$(NO_COLOR=1 "$CCLEAN" -n "$d" | grep -c "$(printf '\033')")"
 
+# --color is the more specific instruction: it decides for the run, over both
+# the terminal check and the environment.
+check "--color=always colours a pipe" yes \
+      "$(NO_COLOR=1 "$CCLEAN" --color=always -n "$d" | coloured)"
+check "--color=never leaves a terminal plain" no \
+      "$("$CCLEAN" --color=never -n "$d" | coloured)"
+check "--color WHEN takes a separate argument" yes \
+      "$("$CCLEAN" --color always -n "$d" | coloured)"
+check "--color=auto matches the default" no \
+      "$("$CCLEAN" --color=auto -n "$d" | coloured)"
+
+"$CCLEAN" --color=purple -n "$d" >/dev/null 2>&1
+check "unknown colour setting exits 2" 2 $?
+
+"$CCLEAN" --color >/dev/null 2>&1
+check "--color without a setting exits 2" 2 $?
+
 # ------------------------------------------------------ argument handling
 
 d=$WORK/dashes
@@ -719,8 +789,9 @@ check "-- ends option parsing" 1 \
 
 # Every argument after ROOT is still a pattern, not a path to walk.
 d=$(fixture patterns)
-check "command line pattern is added to the defaults" 4 \
-      "$("$CCLEAN" -n "$d" "*.log" | grep -c '  ')"
+check "command line pattern is added to the defaults" \
+      "4 targets, 17 B to reclaim" \
+      "$("$CCLEAN" -n "$d" "*.log" | grep 'to reclaim')"
 
 # A pattern that cannot be a valid regular expression must not abort. An
 # earlier build died with an uncaught regex_error here.

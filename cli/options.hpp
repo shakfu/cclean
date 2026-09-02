@@ -1,8 +1,11 @@
 #ifndef CCLEAN_CLI_OPTIONS_HPP
 #define CCLEAN_CLI_OPTIONS_HPP
 
+#include <ostream>
 #include <string>
 #include <vector>
+
+#include "terminal.hpp"
 
 namespace cclean::cli {
 
@@ -18,6 +21,7 @@ struct CommandLine {
     bool dependencies = false;
     bool assume_yes = false;
     bool format_json = false;
+    ColorWhen color = ColorWhen::Auto;
 
     std::string older_than;
     std::string larger_than;
@@ -38,7 +42,9 @@ struct CommandLine {
     bool set_larger_than = false;
 };
 
-void print_usage(const char* program);
+// Written to `out`: stdout when --help asked for it, stderr when it follows
+// a rejected argument.
+void print_usage(std::ostream& out, const char* program);
 
 // False means the program is done: `status` is what it should return. That
 // covers --help and --version as well as a rejected argument.

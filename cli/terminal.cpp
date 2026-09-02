@@ -14,11 +14,17 @@ bool is_terminal(int descriptor) {
     return isatty(descriptor) == 1;
 }
 
-Style Style::detect(int descriptor) {
-    const char* const no_color = std::getenv("NO_COLOR");
-
-    if (!is_terminal(descriptor) || (no_color && no_color[0] != '\0')) {
+Style Style::detect(int descriptor, ColorWhen when) {
+    if (when == ColorWhen::Never) {
         return Style{};
+    }
+
+    if (when == ColorWhen::Auto) {
+        const char* const no_color = std::getenv("NO_COLOR");
+
+        if (!is_terminal(descriptor) || (no_color && no_color[0] != '\0')) {
+            return Style{};
+        }
     }
 
     Style style;

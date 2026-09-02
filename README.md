@@ -135,6 +135,7 @@ cclean --no-defaults . "build/**"         # only what is named here
 | `-e`, `--exclude PATTERN` | Leave anything matching alone, contents included. Repeatable |
 | `-v`, `--verbose` | Name every item as it is removed |
 | `-y`, `--yes` | Remove without prompting |
+| `--color WHEN` | Colour output: `auto` (default), `always`, `never` |
 | `--format FORMAT` | Select `human` (default) or `json` output |
 | `--config FILE` | Read this configuration file instead of searching for one |
 | `--no-config` | Read no configuration file at all |
@@ -291,9 +292,21 @@ When standard input is a pipe, a character is read from it instead, so
 
 Progress appears on standard error during long scans and is erased when they finish. Nothing is drawn for the first 80 milliseconds, so quick runs stay silent. The target list goes to standard output, so redirecting it leaves a clean file.
 
-Colour is used for directories, totals, and failures. It is disabled automatically when output is not a terminal, and when `NO_COLOR` is set.
+Colour is used for directories, totals, and failures. It is disabled automatically when output is not a terminal, and when `NO_COLOR` is set. `--color` decides for one run instead: `always` colours a pipe, `never` leaves a terminal plain, and both override `NO_COLOR`.
 
 The matched list is printed once. After confirmation you get a one-line summary; only failures are named again. `--verbose` restores the per-item log.
+
+A run that matched more than one reason prints a breakdown under the total:
+
+```text
+5 targets, 1.15 MiB to reclaim
+  default            2    4.00 KiB
+  command-line       1         1 B
+  build-artifact     1  292.97 KiB
+  dependency         1  878.91 KiB
+```
+
+The reasons differ in what it costs to put the target back: a dependency tree needs the network, a build artifact rebuilds offline, a cache is free. Rows follow the order above, cheapest to restore first, rather than by size, so the report does not reorder itself as a tree changes. A run with a single reason prints no breakdown, since it would repeat the total.
 
 `--format json` writes one JSON document to standard output. It includes the root, the configuration file the run used (`config`, or `null`), status, matched targets, logical byte totals, per-reason statistics, and warnings. Progress, prompts, and other diagnostics go to standard error. Each target includes a `reason`: `default`, `config`, `command-line`, `build-artifact`, or `dependency`, and a dependency target also carries `restore`, the command that puts the tree back.
 

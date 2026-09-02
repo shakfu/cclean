@@ -2,9 +2,13 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.2.1]
 
 ### Added
+
+- `--color WHEN`, one of `auto` (the default), `always` or `never`. Colour was decided by the terminal check and `NO_COLOR` alone, so a run piped to `less -R` could not keep it and a single run could not drop it without setting an environment variable. `always` overrides both, since a flag typed for one run is the more specific instruction.
+
+- A breakdown by reason under the total in human output, printed when a run matched more than one. The total says how much, not how much of what, and the reasons differ in what it costs to undo the removal: a dependency tree needs the network, a build artifact rebuilds offline, a cache is free. JSON has carried the same split as `stats` since the format existed. Rows follow the order the reasons are declared, cheapest to restore first, so a report does not reorder itself as a tree changes.
 
 - `--config FILE` and `--no-config`. The upward search for `.cclean.toml` does not stop at the project, so a file in a home directory supplied `patterns`, `build_artifacts`, `dependencies` and `skip_protected` to every run beneath it, with nothing in the output naming the file responsible -- and `skip_protected = false` in a forgotten ancestor turned off the protection on `.git`, `.ssh` and `.gnupg` for every run after it. Neither of the new options depends on what sits above the checkout, which is what a scripted or CI run needs. `--verbose` now names the file a run used, and JSON output carries it as `config`.
 
@@ -24,7 +28,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - A CI workflow: GCC and Clang on Linux and Clang on macOS, and both suites under AddressSanitizer with UndefinedBehaviorSanitizer and under ThreadSanitizer.
 
-- Regression coverage for everything below: numeric limits at zero, at the maximum, and one past it; marker directories, FIFOs, symlinks, broken symlinks, and `.git` as a file; symlink timestamps; filenames containing newlines, escape sequences, and invalid UTF-8; malformed and duplicated configuration keys; and the terminal confirmation branch, driven through a pseudo-terminal. The suites go from 178 to 323 unit checks and from 136 to 196 command-line checks; all but four of the latter run under root, which cannot be denied the permissions two of them need.
+- Regression coverage for everything below: numeric limits at zero, at the maximum, and one past it; marker directories, FIFOs, symlinks, broken symlinks, and `.git` as a file; symlink timestamps; filenames containing newlines, escape sequences, and invalid UTF-8; malformed and duplicated configuration keys; and the terminal confirmation branch, driven through a pseudo-terminal. The suites go from 178 to 327 unit checks and from 136 to 212 command-line checks; all but four of the latter run under root, which cannot be denied the permissions two of them need.
 
 ### Changed
 
@@ -51,6 +55,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 - The README states the contracts these changes settle: the accepted configuration subset rather than an implication of full TOML, how filenames are escaped in each output format, that a symlink is filtered on its own timestamp, and how deletion resolves a path.
 
 ### Fixed
+
+- `--help` writes to standard output. It went to standard error, so `cclean --help | less` showed an empty screen and `cclean --help > usage.txt` wrote an empty file, while `--version` already used standard output. Usage printed after a rejected argument stays on standard error, where it is a diagnostic rather than the thing asked for.
 
 - The no-follow property of the deletion path stopped at the target's parent. That directory was opened by its whole path, which resolved every component by name after the scan had listed them and before the identity check could mean anything, so an interior directory replaced by a symlink in that window sent the removal wherever the link pointed -- while every open below the parent already refused to follow one. Reproduced by calling `remove_target()` with a target under a symlinked interior component: the file outside the tree was removed and the call reported success. Every component from the root down is now opened with `O_NOFOLLOW` through the descriptor above it, and a component that has become a symlink is named as such rather than reported as "Not a directory". The root itself is still opened by name and followed, because the user typed it. It costs nothing measurable: a run over the benchmark tree takes the same 270 ms it did before the walk.
 
@@ -160,4 +166,4 @@ Glob matching is open-coded rather than translated to `std::regex`. Regex was 25
 
 A matched directory is removed whole and is not descended into, so its contents appear in neither the walk nor the listing. Counting a directory and the matched files inside it separately doubles the reported total.
 
-[0.2.0]: <https://github.com/shakfu/cclean/releases/tag/0.2.0> [0.1.1]: <https://github.com/shakfu/cclean/releases/tag/0.1.1> [0.1.0]: <https://github.com/shakfu/cclean/releases/tag/0.1.0>
+[0.2.1]: <https://github.com/shakfu/cclean/releases/tag/0.2.1> [0.2.0]: <https://github.com/shakfu/cclean/releases/tag/0.2.0> [0.1.1]: <https://github.com/shakfu/cclean/releases/tag/0.1.1> [0.1.0]: <https://github.com/shakfu/cclean/releases/tag/0.1.0>

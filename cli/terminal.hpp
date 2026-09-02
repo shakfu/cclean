@@ -11,8 +11,14 @@ namespace cclean::cli {
 
 bool is_terminal(int descriptor);
 
+// What --color asked for. Auto is the default: colour when the stream is a
+// terminal and NO_COLOR is unset.
+enum class ColorWhen { Auto, Always, Never };
+
 // Escape sequences resolve to empty strings off a terminal, so the same output
-// code serves a pipe. NO_COLOR is honoured (https://no-color.org).
+// code serves a pipe. NO_COLOR is honoured (https://no-color.org) unless
+// --color=always overrides it, since a flag typed for one run is the more
+// specific instruction.
 struct Style {
     const char* reset = "";
     const char* dim = "";
@@ -22,7 +28,7 @@ struct Style {
     const char* failure = "";
     const char* success = "";
 
-    static Style detect(int descriptor);
+    static Style detect(int descriptor, ColorWhen when = ColorWhen::Auto);
 };
 
 // A single rewritten line on stderr, so a redirected target list stays clean.

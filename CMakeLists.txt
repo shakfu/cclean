@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(cclean
-    VERSION 0.2.0
+    VERSION 0.2.1
     DESCRIPTION "Removes build caches and editor debris from a directory tree"
     LANGUAGES CXX)
 

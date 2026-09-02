@@ -2,6 +2,9 @@
 // libcclean; what is left here is argument parsing, the config-over-flag
 // precedence, the confirmation, and the human-readable report.
 
+#include <algorithm>
+#include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <string>
 #include <system_error>
@@ -111,6 +114,79 @@ void print_warnings(const std::vector<std::string>& warnings,
     }
 }
 
+// The grand total says how much, not how much of what. A dependency tree needs
+// the network to come back, a build artifact rebuilds offline, and a cache is
+// free, so the split is the shape of the decision the prompt is about to ask
+// for. JSON has carried it as `stats` since the format existed.
+//
+// Reasons are listed in the order they are declared, cheapest to restore
+// first, rather than by size: a run should not reorder its own report as a
+// tree changes underneath it.
+void print_reason_summary(const std::vector<Target>& targets,
+                          const Style& style) {
+    struct Row {
+        Reason reason;
+        std::size_t count = 0;
+        std::uintmax_t size = 0;
+    };
+
+    Row rows[] = {
+        {Reason::Default},
+        {Reason::Config},
+        {Reason::CommandLine},
+        {Reason::BuildArtifact},
+        {Reason::Dependency}
+    };
+
+    std::size_t present = 0;
+
+    for (const Target& target : targets) {
+        for (Row& row : rows) {
+            if (row.reason != target.reason) {
+                continue;
+            }
+
+            if (row.count++ == 0) {
+                ++present;
+            }
+
+            row.size = saturating_add(row.size, target.size);
+            break;
+        }
+    }
+
+    // One reason means the breakdown is the total line again.
+    if (present < 2) {
+        return;
+    }
+
+    std::size_t label_width = 0;
+    std::size_t size_width = 0;
+
+    for (const Row& row : rows) {
+        if (row.count == 0) {
+            continue;
+        }
+
+        label_width =
+            std::max(label_width, std::strlen(reason_name(row.reason)));
+        size_width = std::max(size_width, format_size(row.size).size());
+    }
+
+    for (const Row& row : rows) {
+        if (row.count == 0) {
+            continue;
+        }
+
+        std::cout << "  " << style.dim << std::left
+                  << std::setw(static_cast<int>(label_width))
+                  << reason_name(row.reason) << std::right << "  "
+                  << std::setw(4) << row.count << "  "
+                  << std::setw(static_cast<int>(size_width))
+                  << format_size(row.size) << style.reset << '\n';
+    }
+}
+
 void print_targets(const std::vector<Target>& targets,
                    std::uintmax_t total_size,
                    const Style& style) {
@@ -142,6 +218,8 @@ void print_targets(const std::vector<Target>& targets,
               << (targets.size() == 1 ? " target, " : " targets, ")
               << style.bold << format_size(total_size) << style.reset
               << " to reclaim\n";
+
+    print_reason_summary(targets, style);
 }
 
 // ROOT is one directory and everything after it is a pattern, so `cclean a b`
@@ -329,8 +407,8 @@ int main(int argc, char* argv[]) {
 
     progress.finish();
 
-    const Style out = Style::detect(STDOUT_FILENO);
-    const Style err = Style::detect(STDERR_FILENO);
+    const Style out = Style::detect(STDOUT_FILENO, args.color);
+    const Style err = Style::detect(STDERR_FILENO, args.color);
 
     print_warnings(result.warnings, err);
 

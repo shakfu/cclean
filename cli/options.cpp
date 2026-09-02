@@ -7,8 +7,8 @@
 
 namespace cclean::cli {
 
-void print_usage(const char* program) {
-    std::cerr
+void print_usage(std::ostream& out, const char* program) {
+    out
         << "Usage:\n"
         << "  " << program << " [OPTION ...] ROOT [PATTERN ...]\n\n"
         << "Built-in patterns, added to any given on the command line:\n"
@@ -25,6 +25,7 @@ void print_usage(const char* program) {
         << "                 included. Repeatable\n"
         << "  -v, --verbose  Name every item as it is removed\n"
         << "  -y, --yes      Remove without prompting\n"
+        << "  --color WHEN   Colour output: auto (default), always, never\n"
         << "  --format FORMAT  Output human (default) or json\n"
         << "  --config FILE  Read this configuration file instead of\n"
         << "                 searching upward from ROOT\n"
@@ -73,6 +74,27 @@ bool parse_format(const std::string& value, bool& format_json) {
     }
 
     std::cerr << "Unknown format: " << value << '\n';
+    return false;
+}
+
+bool parse_color(const std::string& value, ColorWhen& color) {
+    if (value == "auto") {
+        color = ColorWhen::Auto;
+        return true;
+    }
+
+    if (value == "always") {
+        color = ColorWhen::Always;
+        return true;
+    }
+
+    if (value == "never") {
+        color = ColorWhen::Never;
+        return true;
+    }
+
+    std::cerr << "Unknown colour setting: " << value
+              << " (use auto, always, or never)\n";
     return false;
 }
 
@@ -185,6 +207,30 @@ bool parse_command_line(
                 continue;
             }
 
+            if (argument == "--color") {
+                if (i + 1 >= argc) {
+                    std::cerr << argument << " needs a setting.\n";
+                    status = 2;
+                    return false;
+                }
+
+                if (!parse_color(argv[++i], command_line.color)) {
+                    status = 2;
+                    return false;
+                }
+
+                continue;
+            }
+
+            if (argument.rfind("--color=", 0) == 0) {
+                if (!parse_color(argument.substr(8), command_line.color)) {
+                    status = 2;
+                    return false;
+                }
+
+                continue;
+            }
+
             if (argument == "--format") {
                 if (i + 1 >= argc) {
                     std::cerr << argument << " needs a format.\n";
@@ -211,7 +257,9 @@ bool parse_command_line(
             }
 
             if (argument == "-h" || argument == "--help") {
-                print_usage(argv[0]);
+                // Asked for, so it is output rather than a diagnostic:
+                // `cclean --help | less` has to show something.
+                print_usage(std::cout, argv[0]);
                 return false;
             }
 
@@ -240,7 +288,7 @@ bool parse_command_line(
             }
 
             std::cerr << "Unknown option: " << argument << "\n\n";
-            print_usage(argv[0]);
+            print_usage(std::cerr, argv[0]);
             status = 2;
             return false;
         }
