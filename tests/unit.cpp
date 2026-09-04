@@ -1077,6 +1077,179 @@ void test_remove_refuses_symlinked_parent() {
     CHECK(!fs::exists(root / "project" / "keep" / "d.pyc"));
 }
 
+// The scan lists what it found and the removal happens after the user has
+// answered a prompt, so the two are separated by an unbounded interval. A type
+// check cannot span it: a directory replaced by another directory, or a file
+// by another file, satisfies every type the scan recorded. What is recorded is
+// the object -- device and inode -- and removal refuses anything else, whether
+// the replacement was hostile or a build tool rewriting a cache atomically.
+void test_remove_refuses_replaced_target() {
+    group("remove_target identity");
+
+    TempTree tree;
+    const fs::path root = tree.root();
+
+    fs::create_directories(root / "pkg" / "__pycache__" / "keep");
+    std::ofstream(root / "pkg" / "__pycache__" / "a.pyc") << "x";
+    std::ofstream(root / "pkg" / "cache.pyc") << "x";
+
+    ScanOptions options;
+    options.patterns = compile_patterns(true, {}, {});
+
+    const ScanResult scanned = scan(root, options);
+
+    CHECK_EQ(scanned.targets.size(), std::size_t{2});
+
+    for (const Target& target : scanned.targets) {
+        CHECK(target.has_identity);
+    }
+
+    // Both targets are swapped for a different entry of the same type, which
+    // is what an atomic replacement leaves behind: the name resolves, the type
+    // agrees, and the inode does not.
+    const fs::path directory = root / "pkg" / "__pycache__";
+    const fs::path file = root / "pkg" / "cache.pyc";
+
+    fs::create_directories(root / "swapped" / "evidence");
+    fs::remove_all(directory);
+    fs::rename(root / "swapped", directory);
+
+    std::ofstream(root / "other.pyc") << "y";
+    fs::rename(root / "other.pyc", file);
+
+    std::string error;
+
+    for (const Target& target : scanned.targets) {
+        CHECK(!remove_target(root, target, error));
+        CHECK(error.find("replaced") != std::string::npos);
+        CHECK(error.find(target.path.string()) != std::string::npos);
+    }
+
+    // Neither replacement was touched.
+    CHECK(fs::exists(directory / "evidence"));
+    CHECK(fs::exists(file));
+
+    // A rescan sees the replacements as they now are and removes them, so the
+    // refusal is about identity and not a directory the tool can no longer
+    // delete at all.
+    const ScanResult again = scan(root, options);
+
+    CHECK_EQ(again.targets.size(), std::size_t{2});
+
+    for (const Target& target : again.targets) {
+        CHECK(remove_target(root, target, error));
+    }
+
+    CHECK(!fs::exists(directory));
+    CHECK(!fs::exists(file));
+}
+
+// A caller that filters or builds its own list can hand remove_targets() the
+// same subtree twice: a path repeated, two spellings of one path, or a
+// directory together with something inside it. Dispatched as they stand, two
+// workers descend the same tree and the one that arrives second reports a
+// failure for a path that was removed -- and which one that is varies between
+// runs. Each such target has to report the outcome of the removal that
+// actually covered it.
+void test_remove_targets_overlapping() {
+    group("remove_targets overlap");
+
+    TempTree tree;
+    const fs::path root = tree.root();
+
+    fs::create_directories(root / "pkg" / "cache" / "inner");
+    std::ofstream(root / "pkg" / "cache" / "a.pyc") << "x";
+    std::ofstream(root / "pkg" / "cache" / "inner" / "b.pyc") << "x";
+    std::ofstream(root / "pkg" / "loose.pyc") << "x";
+
+    auto directory_at = [](const fs::path& path) {
+        Target target;
+        target.path = path;
+        target.is_directory = true;
+        return target;
+    };
+
+    auto file_at = [](const fs::path& path) {
+        Target target;
+        target.path = path;
+        return target;
+    };
+
+    // The covering directory, a repeat of it, two other spellings of it, a
+    // file inside it, a directory inside it, and one unrelated target that
+    // must be unaffected by any of it.
+    const std::vector<Target> targets = {
+        directory_at(root / "pkg" / "cache"),
+        directory_at(root / "pkg" / "cache"),
+        directory_at(root / "pkg" / "." / "cache"),
+        directory_at(root / "pkg" / "cache" / ""),
+        file_at(root / "pkg" / "cache" / "a.pyc"),
+        directory_at(root / "pkg" / "cache" / "inner"),
+        file_at(root / "pkg" / "loose.pyc"),
+    };
+
+    const std::vector<RemovalResult> results = remove_targets(root, targets);
+
+    CHECK_EQ(results.size(), targets.size());
+
+    bool all_removed = true;
+
+    for (const RemovalResult& result : results) {
+        if (!result.removed || !result.error.empty()) {
+            all_removed = false;
+        }
+    }
+
+    CHECK(all_removed);
+    CHECK(!fs::exists(root / "pkg" / "cache"));
+    CHECK(!fs::exists(root / "pkg" / "loose.pyc"));
+
+    // A covered target reports the covering target's failure rather than an
+    // "already gone" of its own, so a run that fails fails once, consistently.
+    fs::create_directories(root / "held" / "cache" / "inner");
+    std::ofstream(root / "held" / "cache" / "keep.pyc") << "x";
+    fs::permissions(root / "held", fs::perms::owner_read |
+                                       fs::perms::owner_exec);
+
+    const std::vector<Target> blocked = {
+        directory_at(root / "held" / "cache"),
+        directory_at(root / "held" / "cache" / "inner"),
+    };
+
+    const std::vector<RemovalResult> denied = remove_targets(root, blocked);
+
+    fs::permissions(root / "held", fs::perms::owner_all);
+
+    // Running as root defeats the permission bits, in which case both are
+    // simply removed together and there is nothing to compare.
+    if (!denied[0].removed) {
+        CHECK(!denied[1].removed);
+        CHECK_EQ(denied[0].error, denied[1].error);
+        // The error names the covering target, which is the removal that
+        // actually failed, and not the target that never ran.
+        CHECK(denied[1].error.find(blocked[0].path.string()) !=
+              std::string::npos);
+        CHECK(fs::exists(root / "held" / "cache"));
+    }
+
+    // A symlink covers nothing: unlinking it leaves what it points at alone,
+    // so a target named below one keeps its own error.
+    fs::create_directories(root / "real");
+    std::ofstream(root / "real" / "c.pyc") << "x";
+    fs::create_directory_symlink(root / "real", root / "link");
+
+    Target link;
+    link.path = root / "link";
+    link.is_symlink = true;
+
+    const std::vector<RemovalResult> through =
+        remove_targets(root, {link, file_at(root / "link" / "c.pyc")});
+
+    CHECK(through[0].removed);
+    CHECK(!through[1].removed);
+    CHECK(fs::exists(root / "real" / "c.pyc"));
+}
+
 }  // namespace
 
 int main() {
@@ -1108,6 +1281,8 @@ int main() {
     test_parallel_scan_propagates_exceptions();
     test_remove_targets();
     test_remove_refuses_symlinked_parent();
+    test_remove_refuses_replaced_target();
+    test_remove_targets_overlapping();
 
     if (g_failures == 0) {
         std::printf("unit: %d checks passed\n", g_checks);

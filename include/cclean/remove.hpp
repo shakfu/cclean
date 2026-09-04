@@ -32,6 +32,19 @@ namespace cclean {
 // `root` itself is opened by name and followed, because the user typed it and
 // may legitimately have reached it through a symlink. Every name below it came
 // from the scan instead, and none of them is followed.
+//
+// The descriptor the walk ends on is checked for the type the scan saw and for
+// the device and inode it recorded, because a type is not an identity: between
+// the list being displayed and the user answering the prompt, a directory can
+// be replaced by another directory, and a file by another file. A directory is
+// then opened, confirmed a second time through fstat() on the descriptor
+// itself, and emptied through it. A non-directory is unlinked by name one
+// syscall after its identity was confirmed -- narrowed to that interval rather
+// than closed, since there is no handle to unlink through.
+//
+// A Target built by hand carries no identity (`has_identity` false) and is
+// checked by type alone: it was never reviewed against a displayed list, so
+// there is nothing for a replacement to have been substituted for.
 bool remove_target(
     const fs::path& root,
     const Target& target,
@@ -63,6 +76,16 @@ struct RemovalResult {
 //
 // Results are returned in the order the targets were given, so what a caller
 // prints does not depend on which worker drew which target.
+//
+// The list may overlap: scan() never emits a descendant of a matched
+// directory, but a caller that built or filtered its own list can pass the
+// same path twice, or pass both `cache` and `cache/item`, or two spellings of
+// one path. Removing those concurrently would race two workers down one
+// subtree and turn the loser's "already gone" into a reported failure, so a
+// target that another target covers is not dispatched: it is removed as part
+// of that one and reports its outcome, error included, which then names the
+// covering path rather than its own. A path below a symlink target is not
+// covered by it, since unlinking a symlink removes nothing underneath.
 std::vector<RemovalResult> remove_targets(
     const fs::path& root,
     const std::vector<Target>& targets);

@@ -2,6 +2,22 @@
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A reviewed target could be replaced by another entry of the same type before it was removed. The scan recorded whether an entry was a directory or a symlink and nothing else, and `remove_target()` compared only those two flags against a fresh `fstatat()` immediately before deleting -- so a directory swapped for a different directory, or a file for a different file, matched every check and was removed. The window is not a narrow one: the whole point of the confirmation prompt is that the program stops and waits between showing the list and acting on it, and it needs no attacker to open, since build tools routinely replace a cache or output directory atomically while a run is in progress. The scan now records each target's device and inode from the no-follow stat it already had to take, and removal refuses anything else with "Target was replaced since it was scanned". A matched directory is opened and confirmed a second time through `fstat()` on the descriptor itself, then emptied through that descriptor rather than through its name; the final `unlinkat(AT_REMOVEDIR)` names the entry again, but AT_REMOVEDIR bounds what that can reach to an empty directory. Anything that is not a directory is unlinked one syscall after its identity was confirmed, which narrows the window to two adjacent syscalls rather than closing it, since there is no descriptor to unlink through. A `Target` a caller built by hand carries no identity and is still checked by type alone: it was never reviewed against a displayed list, so there is nothing for a replacement to have been substituted for.
+
+- `remove_targets(root, targets)` dispatched overlapping targets concurrently. A scan never lists a descendant of a matched directory, but that overload exists for a caller removing a list it filtered or built itself, and it queued every entry without looking at the others. A list holding `cache` and `cache/item`, or one path written two ways, therefore raced two workers down the same subtree: the one that arrived second found the name already gone and reported a failure for a target that had in fact been removed, and which of the two lost varied between runs. Every target is now attributed to the outermost target that covers it, and only those are dispatched; a covered target reports the outcome of the removal that covered it, error included. Duplicates, parent and child, and lexically distinct spellings of one path (`pkg/./cache`, `pkg/cache/`) are all one target. A path below a symlink target is not covered by it, because unlinking a symlink removes nothing underneath, and keeps its own error.
+
+- The README said an unreadable directory makes the command exit with status 1. The exit-code table two sections above it already gave that case status 3, which is what the program does; a script following the later sentence would have read an incomplete scan as a failed removal. The comment in `src/json.cpp` said the same thing and would have reintroduced the confusion during maintenance.
+
+### Changed
+
+- `Target` carries `device`, `inode` and `has_identity`, widened to `std::uint64_t` so that no POSIX type appears in a public header. Existing code that constructs a `Target` continues to compile and to be removed as before.
+
+- Scanning and ordinary deletion are unchanged: over the 70,000-entry tree with 1,200 targets, a dry run takes the same 28 ms and a full run the same 76 ms it did before. The identity check costs one `lstat` per matched target during the scan, and the overlap pass costs a sort of the list, so both scale with the number of targets rather than the size of the tree; over a list of 20,000 targets a full run goes from 221 ms to 227 ms. Two-thirds of that had been the overlap pass alone, and is gone: a path that came from the scan is already lexically normal, which one read of the string decides more cheaply than rebuilding it, and a list that is already sorted -- which is what `scan()` returns -- is detected in a linear pass rather than sorted again.
+
 ## [0.2.1]
 
 ### Added

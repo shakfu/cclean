@@ -45,18 +45,6 @@ fs::file_time_type from_unix_seconds(std::int64_t seconds) {
                      std::chrono::seconds(seconds)));
 }
 
-// True when the timestamp could be read.
-bool symlink_write_time(const fs::path& path, fs::file_time_type& when) {
-    struct stat info;
-
-    if (::lstat(path.c_str(), &info) != 0) {
-        return false;
-    }
-
-    when = from_unix_seconds(static_cast<std::int64_t>(info.st_mtime));
-    return true;
-}
-
 std::uintmax_t file_size_or_zero(
     const fs::directory_entry& entry,
     std::vector<std::string>& errors)
@@ -195,14 +183,31 @@ void scan_tree(
                 target.is_directory = is_directory;
                 target.is_symlink = is_symlink;
 
+                // The one no-follow stat this target needs, taken once. It
+                // carries the identity removal re-checks after the user has
+                // reviewed the list, and for a symlink it is also where the
+                // timestamp comes from.
+                struct stat info;
+                const bool stated = ::lstat(path.c_str(), &info) == 0;
+
+                if (stated) {
+                    target.device = static_cast<std::uint64_t>(info.st_dev);
+                    target.inode = static_cast<std::uint64_t>(info.st_ino);
+                    target.has_identity = true;
+                }
+
                 // An unreadable mtime is recorded, not reported. It is only
                 // ever consulted by the age filter, which raises its own
                 // "Cannot apply age filter" error for the same target; warning
                 // here as well made every run without the filter exit 1 over a
                 // value it never read.
                 if (is_symlink) {
-                    target.has_time =
-                        symlink_write_time(path, target.newest_time);
+                    target.has_time = stated;
+
+                    if (stated) {
+                        target.newest_time = from_unix_seconds(
+                            static_cast<std::int64_t>(info.st_mtime));
+                    }
                 } else {
                     std::error_code time_ec;
                     target.newest_time = entry.last_write_time(time_ec);

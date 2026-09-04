@@ -22,7 +22,7 @@
 
 - [x] **Unreadable directories are reported**: permission failures become warnings and return status 3, which is theirs alone; status 1 is a root that cannot be read or a removal that failed.
 
-- [x] **Atomic pre-delete validation**: every component from `ROOT` down is opened `O_NOFOLLOW` through the descriptor above it, the type check runs against the descriptor the walk ends on, and every removal names an entry within a directory descriptor, so a path re-resolved between the check and the removal can no longer point somewhere else. `ROOT` itself is opened by name, because the user typed it.
+- [x] **Atomic pre-delete validation**: every component from `ROOT` down is opened `O_NOFOLLOW` through the descriptor above it, and every removal names an entry within a directory descriptor, so a path re-resolved between the check and the removal can no longer point somewhere else. `ROOT` itself is opened by name, because the user typed it. The entry the walk ends on is checked for the device and inode the scan recorded, not merely its type, so a directory replaced by another directory while the list was on screen is refused; a matched directory is confirmed a second time through `fstat()` on its own descriptor and emptied through it. A target that is not a directory has no descriptor to unlink through, so its check and its `unlinkat()` are adjacent syscalls rather than one operation -- the remaining window, and the smallest one the POSIX interface allows.
 
 - [x] **Configuration can be pinned or switched off**: the upward search does not stop at the project, so `--config FILE` names the file to read and `--no-config` reads none. `--verbose` and the JSON document name the file a run used.
 

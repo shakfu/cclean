@@ -347,7 +347,11 @@ The tree walk uses the same work queue, so listing directories is spread across 
 
 ## How deletion works
 
-Removal is descriptor-relative from `ROOT` down. Each component of a reviewed target's path is opened with `O_NOFOLLOW`, one at a time, through the descriptor the component above it returned; the entry is then confirmed to still have the type it had when the list was shown, and every removal names an entry within a directory descriptor rather than re-resolving a path. Directories are emptied the same way. So a symlink substituted for a directory mid-run is an error rather than a way out of the tree, and a component renamed after the scan cannot be reached by name at all.
+Removal is descriptor-relative from `ROOT` down. Each component of a reviewed target's path is opened with `O_NOFOLLOW`, one at a time, through the descriptor the component above it returned, and every removal names an entry within a directory descriptor rather than re-resolving a path. Directories are emptied the same way. So a symlink substituted for a directory mid-run is an error rather than a way out of the tree, and a component renamed after the scan cannot be reached by name at all.
+
+The entry itself is then confirmed to be the same object the scan found, not merely something of the same type. The scan records each target's device and inode from a no-follow stat, and removal refuses a mismatch: a run displays its list and waits for an answer, and in that window a directory can be replaced by another directory, or a file by another file, by an attacker or by a build tool rewriting a cache atomically. A matched directory is opened and checked a second time through `fstat()` on the descriptor, and emptied through it. Anything else is unlinked by name immediately after the check, which narrows the window to two adjacent syscalls rather than closing it, since there is no descriptor to unlink through.
+
+A target the library is given twice, or a directory given together with something inside it, is removed once. This cannot arise from a scan, which never lists a descendant of a matched directory, but the library accepts a list a caller filtered or built. Removing such a list concurrently would race two workers down one subtree and turn the loser's "already gone" into a reported failure, so a covered target is not removed separately: it reports the outcome of the removal that covered it.
 
 `ROOT` itself is opened by name and followed, because you typed it and may have reached it through a symlink. Every name below it came from the scan, and none of them is followed.
 
@@ -357,7 +361,7 @@ Targets are removed in parallel, across the same worker pool the scan uses. Remo
 
 ## Limitations
 
-- Unreadable directories are reported as warnings and make the command exit with status 1. The root itself must be readable.
+- Unreadable directories are reported as warnings and make the command exit with status 3. The root itself must be readable; a root that cannot be inspected is status 1.
 
 - A removal that is already in progress cannot be undone by a change made underneath it. The identity check happens once, before the walk down a matched directory begins; entries created inside that directory while it is being emptied are removed along with the rest.
 

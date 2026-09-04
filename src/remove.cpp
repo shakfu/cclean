@@ -1,7 +1,12 @@
 #include "cclean/remove.hpp"
 
+#include <algorithm>
 #include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <numeric>
+#include <string>
 #include <vector>
 
 #include <dirent.h>
@@ -139,6 +144,57 @@ int open_parent(
     return parent;
 }
 
+// True when the entry the descriptor or the stat refers to is the same object
+// the scan recorded. A Target a caller built by hand carries no identity and
+// was never reviewed against a displayed list, so it is checked by type alone.
+bool identity_matches(const Target& target, const struct stat& info) {
+    return !target.has_identity ||
+           (static_cast<std::uint64_t>(info.st_dev) == target.device &&
+            static_cast<std::uint64_t>(info.st_ino) == target.inode);
+}
+
+bool remove_entry_at(
+    int parent,
+    const std::string& name,
+    const fs::path& shown,
+    std::string& error);
+
+// Removes everything inside an open directory, through that descriptor rather
+// than through its name. Takes ownership of `directory` either way: it is
+// closed before this returns, whether the emptying succeeded or not.
+bool empty_directory(
+    int directory,
+    const fs::path& shown,
+    std::string& error)
+{
+    // fdopendir() takes ownership of the descriptor, and closedir() closes it,
+    // so the stream is kept open until the children are gone and dirfd() is
+    // what the recursion descends through.
+    DIR* stream = ::fdopendir(directory);
+
+    if (stream == nullptr) {
+        error = errno_message(shown);
+        ::close(directory);
+        return false;
+    }
+
+    std::vector<std::string> names;
+    bool ok = read_directory(stream, shown, names, error);
+
+    if (ok) {
+        for (const std::string& child : names) {
+            if (!remove_entry_at(::dirfd(stream), child, shown / child,
+                                 error)) {
+                ok = false;
+                break;
+            }
+        }
+    }
+
+    ::closedir(stream);
+    return ok;
+}
+
 // One descriptor and one stack frame are held per level, for as long as the
 // level below is being emptied. That is the price of the property: the
 // descriptor is what makes the next step relative to a directory that has
@@ -188,33 +244,7 @@ bool remove_entry_at(
         return false;
     }
 
-    // fdopendir() takes ownership of the descriptor, and closedir() closes it,
-    // so the stream is kept open until the children are gone and dirfd() is
-    // what the recursion descends through.
-    DIR* stream = ::fdopendir(directory);
-
-    if (stream == nullptr) {
-        error = errno_message(shown);
-        ::close(directory);
-        return false;
-    }
-
-    std::vector<std::string> names;
-    bool ok = read_directory(stream, shown, names, error);
-
-    if (ok) {
-        for (const std::string& child : names) {
-            if (!remove_entry_at(::dirfd(stream), child, shown / child,
-                                 error)) {
-                ok = false;
-                break;
-            }
-        }
-    }
-
-    ::closedir(stream);
-
-    if (!ok) {
+    if (!empty_directory(directory, shown, error)) {
         return false;
     }
 
@@ -224,6 +254,134 @@ bool remove_entry_at(
     }
 
     return true;
+}
+
+// The directory form of a reviewed target. fstatat() answered for the name;
+// this opens the name and asks the object, so a directory replaced by another
+// directory between the two is refused here rather than emptied. Everything
+// below is then removed through that verified descriptor, which is the same
+// discipline the walk down from `root` already follows.
+bool remove_verified_directory(
+    int parent,
+    const std::string& name,
+    const Target& target,
+    std::string& error)
+{
+    const int directory = ::openat(parent, name.c_str(),
+                                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                   O_CLOEXEC);
+
+    if (directory < 0) {
+        if (errno == ENOENT) {
+            error = "Target changed or disappeared: " + target.path.string();
+        } else if (errno == ENOTDIR || errno == ELOOP) {
+            error = "Target changed type: " + target.path.string();
+        } else {
+            error = errno_message(target.path);
+        }
+
+        return false;
+    }
+
+    struct stat info;
+
+    if (::fstat(directory, &info) != 0) {
+        error = errno_message(target.path);
+        ::close(directory);
+        return false;
+    }
+
+    if (!S_ISDIR(info.st_mode) || !identity_matches(target, info)) {
+        error = "Target was replaced since it was scanned: " +
+                target.path.string();
+        ::close(directory);
+        return false;
+    }
+
+    if (!empty_directory(directory, target.path, error)) {
+        return false;
+    }
+
+    // The name is resolved once more here, and what it finds need not be the
+    // directory just emptied. AT_REMOVEDIR bounds what that can cost to an
+    // empty directory somebody put there in the meantime: it refuses a
+    // symlink, refuses a file, and refuses a directory with anything in it.
+    if (::unlinkat(parent, name.c_str(), AT_REMOVEDIR) != 0) {
+        error = errno_message(target.path);
+        return false;
+    }
+
+    return true;
+}
+
+// True when normalising `text` would not change it: no empty component, no
+// "." or ".." component, and no trailing separator.
+bool is_lexically_normal(const std::string& text) {
+    if (text.size() > 1 && text.back() == '/') {
+        return false;
+    }
+
+    for (std::size_t start = 0; start <= text.size();) {
+        const std::size_t separator = text.find('/', start);
+        const std::size_t stop =
+            separator == std::string::npos ? text.size() : separator;
+        const std::size_t length = stop - start;
+
+        // An empty component is a doubled separator, except for the leading
+        // one of an absolute path. "." and ".." are what normalising removes.
+        if ((length == 0 && start != 0) ||
+            (length == 1 && text[start] == '.') ||
+            (length == 2 && text[start] == '.' && text[start + 1] == '.')) {
+            return false;
+        }
+
+        if (separator == std::string::npos) {
+            break;
+        }
+
+        start = separator + 1;
+    }
+
+    return true;
+}
+
+// A comparable form of a target's path: lexically normalised, with any
+// trailing separator dropped, so that "a/b", "a/./b" and "a/b/" are one path
+// and anything below it is this key followed by a separator.
+//
+// lexically_normal() rebuilds the path component by component and is most of
+// the cost of this pass over a long list, while a path that came from the scan
+// is already normal. Deciding that is one read of the string.
+std::string coverage_key(const fs::path& path) {
+    std::string key = path.generic_string();
+
+    if (is_lexically_normal(key)) {
+        return key;
+    }
+
+    key = path.lexically_normal().generic_string();
+
+    while (key.size() > 1 && key.back() == '/') {
+        key.pop_back();
+    }
+
+    return key;
+}
+
+// True when `outer` is `inner` or names a directory above it.
+bool covers(const std::string& outer, const std::string& inner) {
+    if (outer == inner) {
+        return true;
+    }
+
+    if (inner.size() <= outer.size() ||
+        inner.compare(0, outer.size(), outer) != 0) {
+        return false;
+    }
+
+    // A root key already ends in the separator; every other key needs one at
+    // the join, so that "/a" does not come out as covering "/ab".
+    return outer == "/" || inner[outer.size()] == '/';
 }
 
 }  // namespace
@@ -268,7 +426,33 @@ bool remove_target(
         return false;
     }
 
-    const bool ok = remove_entry_at(parent, name, target.path, error);
+    // A type is not an identity. The run displayed this list and then waited
+    // for the user, and a directory replaced by another directory in that
+    // window matches every check above; so does a file replaced by another
+    // file. What the scan recorded was the object, and that is what has to
+    // still be there.
+    if (!identity_matches(target, info)) {
+        error = "Target was replaced since it was scanned: " +
+                target.path.string();
+        ::close(parent);
+        return false;
+    }
+
+    bool ok;
+
+    if (is_directory) {
+        ok = remove_verified_directory(parent, name, target, error);
+    } else {
+        // For a directory the descriptor carries the identity from here on.
+        // For everything else there is no such handle: unlinkat() acts on the
+        // name, and the check above was made a syscall earlier rather than as
+        // part of the same operation. That narrows the window to the interval
+        // between two adjacent syscalls instead of the interval a user spends
+        // reading a prompt, which is the difference that matters, but it does
+        // not close it.
+        ok = remove_entry_at(parent, name, target.path, error);
+    }
+
     ::close(parent);
     return ok;
 }
@@ -283,6 +467,66 @@ std::vector<RemovalResult> remove_targets(
         return results;
     }
 
+    // scan() never lists a descendant of a matched directory, but this
+    // overload takes a list the caller built or filtered, which can hold one
+    // path twice or hold both a directory and something inside it. Dispatched
+    // as they stand, two workers would descend the same subtree: whichever
+    // reached a name second would find it already gone and report a failure
+    // for a target that was in fact removed, and which of the two that was
+    // would vary between runs. So every target is first attributed to the
+    // outermost target that covers it, and only those are dispatched.
+    std::vector<std::string> keys;
+    keys.reserve(targets.size());
+
+    for (const Target& target : targets) {
+        keys.push_back(coverage_key(target.path));
+    }
+
+    const auto before = [&](std::size_t a, std::size_t b) {
+        return keys[a] != keys[b] ? keys[a] < keys[b] : a < b;
+    };
+
+    std::vector<std::size_t> order(targets.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+
+    // scan() returns its targets sorted by path, which is the list this
+    // normally gets, and sorting a sorted range still costs its full n log n
+    // of string comparisons. Checking for it first costs n of them.
+    if (!std::is_sorted(order.begin(), order.end(), before)) {
+        std::sort(order.begin(), order.end(), before);
+    }
+
+    // Sorted, a covering key precedes everything it covers, but not always
+    // immediately: "a/b.txt" sorts between "a/b" and "a/b/c". `open` therefore
+    // holds the chain of dispatched targets still above the current one, and
+    // the ones that no longer are get popped first.
+    std::vector<std::size_t> owner(targets.size());
+    std::vector<std::size_t> open;
+
+    for (const std::size_t index : order) {
+        while (!open.empty() && !covers(keys[open.back()], keys[index])) {
+            open.pop_back();
+        }
+
+        // A repeat of the same path always shares an outcome. A path below
+        // another target shares one only when that target is a directory: a
+        // symlink is unlinked without what it points at being touched, so
+        // something named below it is not removed with it -- and the walk down
+        // would refuse to follow it in any case, which is an error worth
+        // reporting on its own target rather than hiding behind another's.
+        const bool covered = !open.empty() &&
+            (keys[open.back()] == keys[index] ||
+             (targets[open.back()].is_directory &&
+              !targets[open.back()].is_symlink));
+
+        if (covered) {
+            owner[index] = open.back();
+        } else {
+            owner[index] = index;
+            open.push_back(index);
+        }
+    }
+
     // The queue is popped from the back, so the indices go in reversed: a run
     // that ends up on one thread then removes in the order the list was
     // reviewed in, which is what a --verbose log reads best in.
@@ -290,7 +534,9 @@ std::vector<RemovalResult> remove_targets(
     queue.reserve(targets.size());
 
     for (std::size_t i = targets.size(); i-- > 0;) {
-        queue.push_back(i);
+        if (owner[i] == i) {
+            queue.push_back(i);
+        }
     }
 
     // Each worker writes one distinct element of `results` and touches nothing
@@ -303,6 +549,16 @@ std::vector<RemovalResult> remove_targets(
             result.removed =
                 remove_target(root, targets[index], result.error);
         });
+
+    // A covered target went with the one covering it, so it reports that
+    // target's outcome: removed when the covering removal succeeded, and the
+    // same error when it did not. Reporting it as a failure of its own would
+    // say the wrong thing about a path that is no longer there.
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+        if (owner[i] != i) {
+            results[i] = results[owner[i]];
+        }
+    }
 
     return results;
 }

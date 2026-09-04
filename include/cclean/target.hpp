@@ -41,6 +41,21 @@ struct Target {
     bool is_directory = false;
     bool is_symlink = false;
 
+    // The identity of the entry itself, from a no-follow stat taken during the
+    // scan: st_dev and st_ino, widened so that no POSIX type appears in a
+    // public header. A run shows this list and then waits for the user, and in
+    // that window an entry can be replaced by another of the same type --
+    // deliberately, or by a build tool rewriting a cache directory atomically.
+    // The type flags above cannot tell the replacement from the original, so
+    // removal re-checks these instead and refuses a mismatch.
+    //
+    // `has_identity` is false only for a Target a caller built by hand rather
+    // than took from scan(); such a target was never reviewed against a
+    // displayed list, so removal falls back to checking the type alone.
+    std::uint64_t device = 0;
+    std::uint64_t inode = 0;
+    bool has_identity = false;
+
     // For a dependency target, the command that puts the tree back -- the one
     // thing a user needs before confirming the removal of something only the
     // network can rebuild. Empty for every other reason, and for a dependency

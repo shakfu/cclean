@@ -25,7 +25,9 @@ void write_json(
     }
 
     // Status reports the action, so a scan warning does not disguise a dry run
-    // as a failed removal. Warnings are their own array, and still set exit 1.
+    // as a failed removal. Warnings are their own array, and set exit 3, which
+    // is theirs alone; exit 1 stays with a root that cannot be read and with a
+    // removal that failed.
     std::string status;
     if (outcome.failed != 0) {
         status = "failed";
