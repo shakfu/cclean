@@ -4,6 +4,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.2]
+
 ### Fixed
 
 - A reviewed target could be replaced by another entry of the same type before it was removed. The scan recorded whether an entry was a directory or a symlink and nothing else, and `remove_target()` compared only those two flags against a fresh `fstatat()` immediately before deleting -- so a directory swapped for a different directory, or a file for a different file, matched every check and was removed. The window is not a narrow one: the whole point of the confirmation prompt is that the program stops and waits between showing the list and acting on it, and it needs no attacker to open, since build tools routinely replace a cache or output directory atomically while a run is in progress. The scan now records each target's device and inode from the no-follow stat it already had to take, and removal refuses anything else with "Target was replaced since it was scanned". A matched directory is opened and confirmed a second time through `fstat()` on the descriptor itself, then emptied through that descriptor rather than through its name; the final `unlinkat(AT_REMOVEDIR)` names the entry again, but AT_REMOVEDIR bounds what that can reach to an empty directory. Anything that is not a directory is unlinked one syscall after its identity was confirmed, which narrows the window to two adjacent syscalls rather than closing it, since there is no descriptor to unlink through. A `Target` a caller built by hand carries no identity and is still checked by type alone: it was never reviewed against a displayed list, so there is nothing for a replacement to have been substituted for.
