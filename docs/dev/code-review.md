@@ -255,9 +255,28 @@ descriptor: a public, currently copyable struct becomes an RAII type with move
 semantics, `include/cclean/scan.hpp` changes, and callers that copy a result
 break.
 
-That is an API break to protect only hand-built targets, which by construction
-were never reviewed against a displayed list and already carry no identity. The
-CLI cannot reach the gap at all, since it always goes through `scan()`. The
+That is an API break to protect only hand-built targets. A target from `scan()`
+is already covered by the identity check: `scan()` records `device`, `inode`
+and `has_identity` (`src/scan.cpp:194-196`), and `remove_target()` refuses a
+descriptor whose `st_dev` and `st_ino` do not match (`src/remove.cpp:151-153`).
+Descending through a replaced root either fails to find the named component or
+lands on a different object, which is refused. If the pair does match, the
+object reached is the one the scan stat'd and the user confirmed, whatever
+pathname led there.
+
+A hand-built target -- one a caller aggregate-initialised rather than took from
+`scan()` -- leaves `has_identity` false and is checked by type alone. That is
+the only case a retained root descriptor would protect, and such a target was
+never displayed for review.
+
+The identity check binds the final component only. Interior components are
+opened `O_NOFOLLOW` but their `st_dev` and `st_ino` are neither recorded nor
+compared, so a replacement root that reproduces the target's pair under a
+different interior path passes the check. The deletion is then of the object
+the user reviewed, which is the approved outcome, but the substitution is not
+detected. The closure rests on that outcome, not on detection.
+
+The CLI cannot reach the gap at all, since it always goes through `scan()`. The
 argument that would reopen this is one about the library's callers.
 
 ## Changes made
