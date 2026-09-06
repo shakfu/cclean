@@ -24,6 +24,34 @@ exec </dev/null
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/cclean-cli.XXXXXX")
 trap 'chmod -R u+w "$WORK" 2>/dev/null; rm -rf "$WORK"' EXIT INT TERM
 
+# Every invocation below goes through this rather than running $CCLEAN
+# directly, so that a status the program does not document is caught wherever
+# it happens. Most assertions read output through a pipeline or a command
+# substitution: the first reports the status of the filter and not of cclean,
+# and the second runs in a subshell that cannot reach the counters, so a
+# crash or a sanitizer abort that still printed the expected line passed
+# unnoticed. The documented statuses are 0, 1, 2 and 3; anything else is
+# appended to a file, which a subshell can write and the summary can read.
+#
+# The status is returned unchanged, so the `exits N` assertions that already
+# capture $? keep asserting exactly what they did.
+UNDOCUMENTED=$WORK/undocumented-status
+: > "$UNDOCUMENTED"
+
+cclean() {
+    "$CCLEAN" "$@"
+    cclean_status=$?
+
+    case $cclean_status in
+        0|1|2|3) ;;
+        *) printf 'exit %s from: cclean %s\n' "$cclean_status" "$*" \
+               >> "$UNDOCUMENTED" ;;
+    esac
+
+    return $cclean_status
+}
+
+
 passed=0
 failed=0
 
@@ -87,14 +115,14 @@ echo "cli: running"
 
 d=$(fixture dryrun)
 before=$(count_files "$d")
-"$CCLEAN" --dry-run "$d" >/dev/null 2>&1
+cclean --dry-run "$d" >/dev/null 2>&1
 check "dry run exits 0" 0 $?
 check "dry run deletes nothing" "$before" "$(count_files "$d")"
 
 # Even with a confirmation waiting on stdin, a dry run must not delete.
 d=$(fixture dryrun_confirm)
 before=$(count_files "$d")
-printf 'y' | "$CCLEAN" --dry-run "$d" >/dev/null 2>&1
+printf 'y' | cclean --dry-run "$d" >/dev/null 2>&1
 check "dry run ignores piped confirmation" "$before" "$(count_files "$d")"
 
 # ----------------------------------------------------------- confirmation
@@ -106,28 +134,28 @@ check "dry run ignores piped confirmation" "$before" "$(count_files "$d")"
 # src/main.py and notes.log are not matched by any default pattern, so both
 # survive a default run.
 d=$(fixture confirm_yes)
-printf 'y' | "$CCLEAN" "$d" >/dev/null 2>&1
+printf 'y' | cclean "$d" >/dev/null 2>&1
 check "y removes matches" 2 "$(count_files "$d")"
 check "y keeps unmatched files" "keep" "$(cat "$d/src/main.py")"
 check "y keeps files no pattern names" "log" "$(cat "$d/notes.log")"
 
 d=$(fixture confirm_upper)
-printf 'Y' | "$CCLEAN" "$d" >/dev/null 2>&1
+printf 'Y' | cclean "$d" >/dev/null 2>&1
 check "Y removes matches" 2 "$(count_files "$d")"
 
 d=$(fixture confirm_no)
 before=$(count_files "$d")
-printf 'n' | "$CCLEAN" "$d" >/dev/null 2>&1
+printf 'n' | cclean "$d" >/dev/null 2>&1
 check "n cancels" "$before" "$(count_files "$d")"
 
 d=$(fixture confirm_eof)
 before=$(count_files "$d")
-"$CCLEAN" "$d" </dev/null >/dev/null 2>&1
+cclean "$d" </dev/null >/dev/null 2>&1
 check "end of input cancels" "$before" "$(count_files "$d")"
 
 d=$(fixture confirm_other)
 before=$(count_files "$d")
-printf 'q' | "$CCLEAN" "$d" >/dev/null 2>&1
+printf 'q' | cclean "$d" >/dev/null 2>&1
 check "any other key cancels" "$before" "$(count_files "$d")"
 
 # --------------------------------------------------------------- reporting
@@ -139,19 +167,26 @@ rm -rf "$d"
 mkdir -p "$d/pkg/__pycache__"
 printf '0123456789' > "$d/pkg/__pycache__/a.pyc"
 printf '0123456789' > "$d/pkg/__pycache__/b.pyc"
-total=$("$CCLEAN" -n "$d" | grep 'to reclaim')
+
+# The assertions below read this run through a pipeline, which reports grep's
+# status and not cclean's, so the status is asserted here once for the shape
+# they all use.
+cclean -n "$d" >/dev/null
+check "sizing run exits 0" 0 $?
+
+total=$(cclean -n "$d" | grep 'to reclaim')
 check "size totals do not double count" "1 target, 20 B to reclaim" "$total"
 
 # A matched directory is one line; its contents are not listed again.
-lines=$("$CCLEAN" -n "$d" | grep -c 'pyc\|pycache')
+lines=$(cclean -n "$d" | grep -c 'pyc\|pycache')
 check "matched directory listed once" 1 "$lines"
 
 d=$(fixture verbose)
-quiet_lines=$(printf 'y' | "$CCLEAN" "$d" | grep -c 'removed ')
+quiet_lines=$(printf 'y' | cclean "$d" | grep -c 'removed ')
 check "default output does not list removals" 0 "$quiet_lines"
 
 d=$(fixture verbose_on)
-loud_lines=$(printf 'y' | "$CCLEAN" --verbose "$d" | grep -c 'removed ')
+loud_lines=$(printf 'y' | cclean --verbose "$d" | grep -c 'removed ')
 check "verbose lists each removal" 3 "$loud_lines"
 
 # The grand total says how much, not how much of what: a dependency tree needs
@@ -169,9 +204,12 @@ printf 'c' > "$d/tmp.log"
 printf 'dd' > "$d/build/out"
 printf 'eee' > "$d/node_modules/pkg/index.js"
 
+cclean -n -b -d "$d" "*.log" >/dev/null
+check "reason breakdown run exits 0" 0 $?
+
 # Echoes "COUNT SIZE UNIT" from the summary row for one reason.
 reason_row() {
-    "$CCLEAN" -n -b -d "$d" "*.log" | awk -v r="$1" '$1 == r {print $2, $3, $4}'
+    cclean -n -b -d "$d" "*.log" | awk -v r="$1" '$1 == r {print $2, $3, $4}'
 }
 
 check "summary counts default targets" "2 8 B" "$(reason_row default)"
@@ -179,11 +217,11 @@ check "summary counts command-line targets" "1 1 B" "$(reason_row command-line)"
 check "summary counts build artifacts" "1 2 B" "$(reason_row build-artifact)"
 check "summary counts dependencies" "1 3 B" "$(reason_row dependency)"
 check "summary rows account for the total" "5 targets, 14 B to reclaim" \
-      "$("$CCLEAN" -n -b -d "$d" "*.log" | grep 'to reclaim')"
+      "$(cclean -n -b -d "$d" "*.log" | grep 'to reclaim')"
 
 # A single reason makes the breakdown the total line again.
 check "one reason prints no breakdown" 0 \
-      "$("$CCLEAN" -n "$d/pkg" | grep -c '^  default')"
+      "$(cclean -n "$d/pkg" | grep -c '^  default')"
 
 # ----------------------------------------------------------- configuration
 
@@ -198,14 +236,14 @@ printf 'excludes = ["keep.pyc"]\n' >> "$d/.cclean.toml"
 printf 'defaults = true\n' >> "$d/.cclean.toml"
 
 check "config adds patterns and defaults" "2 targets, 2 B to reclaim" \
-      "$($CCLEAN -n "$d" | grep 'to reclaim')"
-check "config pattern is reported" 1 "$($CCLEAN -n "$d" | grep -c 'remove.tmp')"
-check "config exclude is applied" 0 "$($CCLEAN -n "$d" | grep -c 'keep.pyc')"
+      "$(cclean -n "$d" | grep 'to reclaim')"
+check "config pattern is reported" 1 "$(cclean -n "$d" | grep -c 'remove.tmp')"
+check "config exclude is applied" 0 "$(cclean -n "$d" | grep -c 'keep.pyc')"
 check "CLI defaults override config" 0 \
-      "$($CCLEAN -n --no-defaults "$d" | grep -c 'cache.pyc')"
+      "$(cclean -n --no-defaults "$d" | grep -c 'cache.pyc')"
 
 printf 'unknown_key = true\n' > "$d/.cclean.toml"
-"$CCLEAN" -n "$d" >/dev/null 2>&1
+cclean -n "$d" >/dev/null 2>&1
 check "unknown config key exits 2" 2 $?
 
 # A # opens a comment only outside quotes; emacs lock and autosave files are
@@ -213,7 +251,7 @@ check "unknown config key exits 2" 2 $?
 printf 'x' > "$d/#locked#"
 printf 'patterns = ["#*#"]  # trailing comment\n' > "$d/.cclean.toml"
 printf 'defaults = false\n' >> "$d/.cclean.toml"
-check "quoted # is not a comment" 1 "$($CCLEAN -n "$d" | grep -c 'locked')"
+check "quoted # is not a comment" 1 "$(cclean -n "$d" | grep -c 'locked')"
 
 d=$WORK/monorepo
 rm -rf "$d"
@@ -223,21 +261,21 @@ printf 'xx' > "$d/packages/app/build/out"
 mkdir -p "$d/packages/other"
 printf 'project_roots = ["packages/app", "packages/other"]\n' > "$d/.cclean.toml"
 check "configured monorepo project is detected" \
-      "1 target, 2 B to reclaim" "$(cd "$d" && "$CCLEAN" -n -b . | grep 'to reclaim')"
+      "1 target, 2 B to reclaim" "$(cd "$d" && cclean -n -b . | grep 'to reclaim')"
 
 # project_roots resolve against the directory holding .cclean.toml, not ROOT.
 # Resolving against ROOT made every run from a subdirectory fail, including
 # runs that never consult build artifacts.
 check "project_roots work from a subdirectory" \
       "1 target, 2 B to reclaim" \
-      "$(cd "$d/packages/app" && "$CCLEAN" -n -b . | grep 'to reclaim')"
-(cd "$d/packages/app" && "$CCLEAN" -n . >/dev/null 2>&1)
+      "$(cd "$d/packages/app" && cclean -n -b . | grep 'to reclaim')"
+(cd "$d/packages/app" && cclean -n . >/dev/null 2>&1)
 check "config from a parent does not break a plain run" 0 $?
-(cd "$d" && "$CCLEAN" -n -b packages/app >/dev/null 2>&1)
+(cd "$d" && cclean -n -b packages/app >/dev/null 2>&1)
 check "project_roots survive a ROOT below the config" 0 $?
 
 printf 'project_roots = ["../escape"]\n' > "$d/.cclean.toml"
-"$CCLEAN" -n "$d" >/dev/null 2>&1
+cclean -n "$d" >/dev/null 2>&1
 check "project_roots escaping the config directory exits 2" 2 $?
 rm -f "$d/.cclean.toml"
 
@@ -250,20 +288,20 @@ printf 'xx' > "$d/node_modules/pkg/file"
 printf 'x' > "$d/vendor/file"
 printf 'x' > "$d/random/node_modules/file"
 check "dependencies are excluded by default" 0 \
-      "$($CCLEAN -n "$d" | grep -c 'node_modules')"
+      "$(cclean -n "$d" | grep -c 'node_modules')"
 check "marker-guarded dependencies are detected" 1 \
-      "$($CCLEAN -n --dependencies "$d" | grep -c 'node_modules/')"
+      "$(cclean -n --dependencies "$d" | grep -c 'node_modules/')"
 check "unmarked dependency trees are ignored" 0 \
-      "$($CCLEAN -n --dependencies "$d" | grep -c 'random/node_modules')"
+      "$(cclean -n --dependencies "$d" | grep -c 'random/node_modules')"
 
 # package.json carries ranges; only package-lock.json pins the tree that
 # `npm ci` reinstalls.
 rm -f "$d/package-lock.json"
 check "node_modules needs the lock, not the manifest" 0 \
-      "$($CCLEAN -n --dependencies "$d" | grep -c 'node_modules/')"
+      "$(cclean -n --dependencies "$d" | grep -c 'node_modules/')"
 printf 'x' > "$d/package-lock.json"
 check "the lock file qualifies node_modules" 1 \
-      "$($CCLEAN -n --dependencies "$d" | grep -c 'node_modules/')"
+      "$(cclean -n --dependencies "$d" | grep -c 'node_modules/')"
 
 # Every package manager installs into node_modules but writes its own lock,
 # so each name needs its own row.
@@ -273,7 +311,7 @@ for lock in package-lock.json npm-shrinkwrap.json yarn.lock \
           "$d"/pnpm-lock.yaml "$d"/bun.lock "$d"/bun.lockb
     printf 'x' > "$d/$lock"
     check "$lock qualifies node_modules" 1 \
-          "$($CCLEAN -n --dependencies "$d" | grep -c 'node_modules/')"
+          "$(cclean -n --dependencies "$d" | grep -c 'node_modules/')"
 done
 
 # The list is the six npm-compatible lock names. deno.lock also sits beside a
@@ -281,15 +319,15 @@ done
 rm -f "$d"/bun.lockb
 printf 'x' > "$d/deno.lock"
 check "an unlisted lock name is left alone" 0 \
-      "$($CCLEAN -n --dependencies "$d" | grep -c 'node_modules/')"
+      "$(cclean -n --dependencies "$d" | grep -c 'node_modules/')"
 rm -f "$d/deno.lock"
 printf 'x' > "$d/package-lock.json"
 
 # --dependencies matches on layout, so like --build-artifacts it is by itself
 # enough to give a --no-defaults run something to do.
 check "--no-defaults --dependencies still matches" 1 \
-      "$($CCLEAN -n --no-defaults --dependencies "$d" | grep -c 'node_modules/')"
-"$CCLEAN" -n --no-defaults --dependencies "$d" >/dev/null 2>&1
+      "$(cclean -n --no-defaults --dependencies "$d" | grep -c 'node_modules/')"
+cclean -n --no-defaults --dependencies "$d" >/dev/null 2>&1
 check "--no-defaults --dependencies exits 0" 0 $?
 
 # A .venv is a dependency tree only when uv.lock is beside it: that is what
@@ -308,13 +346,13 @@ printf 'x' > "$d/bare/uv.lock"
 printf 'xx' > "$d/bare/venv/lib/f"
 
 check "uv-locked .venv is a dependency target" 1 \
-      "$($CCLEAN -n --dependencies --no-defaults "$d" | grep -c 'uvlocked/.venv/')"
+      "$(cclean -n --dependencies --no-defaults "$d" | grep -c 'uvlocked/.venv/')"
 check "unlocked .venv is left alone" 0 \
-      "$($CCLEAN -n --dependencies --no-defaults "$d" | grep -c 'nolock/.venv')"
+      "$(cclean -n --dependencies --no-defaults "$d" | grep -c 'nolock/.venv')"
 check "a venv without the dot is left alone" 0 \
-      "$($CCLEAN -n --dependencies --no-defaults "$d" | grep -c 'bare/venv')"
+      "$(cclean -n --dependencies --no-defaults "$d" | grep -c 'bare/venv')"
 check "no .venv is touched without --dependencies" 0 \
-      "$($CCLEAN -n "$d" | grep -c '.venv/$')"
+      "$(cclean -n "$d" | grep -c '.venv/$')"
 
 # vendor/ is a generic name, so go.mod is what qualifies it. The list covers
 # three ecosystems deliberately; a vendor/ belonging to anything else is left
@@ -328,9 +366,9 @@ printf 'x' > "$d/other/composer.lock"
 printf 'xx' > "$d/other/vendor/f"
 
 check "go vendor needs only go.mod" 1 \
-      "$($CCLEAN -n --dependencies --no-defaults "$d" | grep -c 'golang/vendor/')"
+      "$(cclean -n --dependencies --no-defaults "$d" | grep -c 'golang/vendor/')"
 check "an unlisted ecosystem's vendor is left alone" 0 \
-      "$($CCLEAN -n --dependencies --no-defaults "$d" | grep -c 'other/vendor')"
+      "$(cclean -n --dependencies --no-defaults "$d" | grep -c 'other/vendor')"
 
 # dependency_markers adds ecosystems the built-in list leaves out. A configured
 # pair takes the same marker guard and the same --dependencies gate as a
@@ -347,20 +385,20 @@ printf 'dependencies = true\n' > "$d/.cclean.toml"
 printf 'dependency_markers = [["deps", "mix.exs"]]\n' >> "$d/.cclean.toml"
 
 check "configured dependency pair is matched" 1 \
-      "$($CCLEAN -n --no-defaults "$d" | grep -c 'app/deps/')"
+      "$(cclean -n --no-defaults "$d" | grep -c 'app/deps/')"
 check "configured pair still needs its marker" 0 \
-      "$($CCLEAN -n --no-defaults "$d" | grep -c 'plain/deps')"
+      "$(cclean -n --no-defaults "$d" | grep -c 'plain/deps')"
 check "configured pair honours excludes" 0 \
-      "$($CCLEAN -n --no-defaults --exclude skipme "$d" | grep -c 'skipme/deps')"
+      "$(cclean -n --no-defaults --exclude skipme "$d" | grep -c 'skipme/deps')"
 
 # The gate is the flag, not the key: turning dependencies off in the config
 # leaves the configured pairs inert.
 printf 'dependencies = false\n' > "$d/.cclean.toml"
 printf 'dependency_markers = [["deps", "mix.exs"]]\n' >> "$d/.cclean.toml"
 check "configured pairs are gated by --dependencies" 0 \
-      "$($CCLEAN -n "$d" | grep -c 'app/deps/')"
+      "$(cclean -n "$d" | grep -c 'app/deps/')"
 check "the flag re-enables configured pairs" 1 \
-      "$($CCLEAN -n --dependencies "$d" | grep -c 'app/deps/')"
+      "$(cclean -n --dependencies "$d" | grep -c 'app/deps/')"
 
 # A marker is looked up beside the directory, so it has to be a plain name.
 for bad in 'dependency_markers = ["deps"]' \
@@ -369,7 +407,7 @@ for bad in 'dependency_markers = ["deps"]' \
            'dependency_markers = [["deps", "../mix.exs"]]' \
            'dependency_markers = [["", "mix.exs"]]'; do
     printf '%s\n' "$bad" > "$d/.cclean.toml"
-    "$CCLEAN" -n "$d" >/dev/null 2>&1
+    cclean -n "$d" >/dev/null 2>&1
     check "malformed dependency_markers exits 2: $bad" 2 $?
 done
 
@@ -383,22 +421,22 @@ printf 'x' > "$d/old.pyc"
 printf '1234567890' > "$d/large.pyc"
 touch -t 202001010000 "$d/old.pyc"
 check "age filter keeps targets older than the duration" 1 \
-      "$($CCLEAN -n --older-than 1d "$d" | grep -c 'old.pyc')"
+      "$(cclean -n --older-than 1d "$d" | grep -c 'old.pyc')"
 check "age filter drops targets younger than the duration" 0 \
-      "$($CCLEAN -n --older-than 1d "$d" | grep -c 'large.pyc')"
+      "$(cclean -n --older-than 1d "$d" | grep -c 'large.pyc')"
 check "size filter selects large targets" 1 \
-      "$($CCLEAN -n --larger-than 5B "$d" | grep -c 'large.pyc')"
+      "$(cclean -n --larger-than 5B "$d" | grep -c 'large.pyc')"
 check "size filter drops small targets" 0 \
-      "$($CCLEAN -n --larger-than 5B "$d" | grep -c 'old.pyc')"
-"$CCLEAN" -n --older-than nonsense "$d" >/dev/null 2>&1
+      "$(cclean -n --larger-than 5B "$d" | grep -c 'old.pyc')"
+cclean -n --older-than nonsense "$d" >/dev/null 2>&1
 check "invalid age filter exits 2" 2 $?
-"$CCLEAN" -n --larger-than nonsense "$d" >/dev/null 2>&1
+cclean -n --larger-than nonsense "$d" >/dev/null 2>&1
 check "invalid size filter exits 2" 2 $?
 
 # A suffix that is merely the last character let "1dd" and "1d5d" read as one
 # day.
 for bad in 1dd 1d5d 1d1; do
-    "$CCLEAN" -n --older-than "$bad" "$d" >/dev/null 2>&1
+    cclean -n --older-than "$bad" "$d" >/dev/null 2>&1
     check "trailing garbage in --older-than $bad exits 2" 2 $?
 done
 
@@ -406,7 +444,7 @@ done
 
 d=$(fixture json)
 json=$WORK/result.json
-"$CCLEAN" -n --format json "$d" >"$json" 2>"$WORK/json.err"
+cclean -n --format json "$d" >"$json" 2>"$WORK/json.err"
 check "JSON dry run exits 0" 0 $?
 check "JSON has no human header" 0 "$(grep -c 'Matched targets' "$json")"
 check "JSON has default reasons" 3 "$(grep -c '\"reason\": \"default\"' "$json")"
@@ -414,7 +452,7 @@ check "JSON has statistics" 1 "$(grep -c '\"stats\"' "$json")"
 check "JSON keeps diagnostics off stdout" 0 "$(grep -c 'Warnings' "$json")"
 
 d=$(fixture json_remove)
-"$CCLEAN" --yes --format=json "$d" >"$json" 2>"$WORK/json_remove.err"
+cclean --yes --format=json "$d" >"$json" 2>"$WORK/json_remove.err"
 check "--yes JSON exits 0" 0 $?
 check "--yes removes targets" 2 "$(count_files "$d")"
 check "--yes does not prompt" 0 "$(grep -c 'Permanently remove' "$json")"
@@ -430,7 +468,7 @@ if unprivileged; then
     mkdir -p "$d/locked" "$d/ok"
     printf 'x' > "$d/ok/a.pyc"
     chmod 000 "$d/locked"
-    "$CCLEAN" -n --format json "$d" >"$json" 2>/dev/null
+    cclean -n --format json "$d" >"$json" 2>/dev/null
     check "scan warning exits 3" 3 $?
     check "warning keeps the dry-run status" 1 \
           "$(grep -c '\"status\": \"dry-run\"' "$json")"
@@ -443,31 +481,31 @@ fi
 
 # ------------------------------------------------------------- exit codes
 
-"$CCLEAN" --help >/dev/null 2>&1
+cclean --help >/dev/null 2>&1
 check "--help exits 0" 0 $?
 
-"$CCLEAN" --bogus >/dev/null 2>&1
+cclean --bogus >/dev/null 2>&1
 check "unknown option exits 2" 2 $?
 
 # Usage that was asked for is output, so `cclean --help | less` shows it.
 # Usage that follows a rejected argument is a diagnostic and stays on stderr.
-"$CCLEAN" --help >"$WORK/help.out" 2>"$WORK/help.err"
+cclean --help >"$WORK/help.out" 2>"$WORK/help.err"
 check "--help writes usage to stdout" 1 "$(grep -c '^Usage:' "$WORK/help.out")"
 check "--help writes nothing to stderr" 0 \
       "$(wc -c < "$WORK/help.err" | tr -d ' ')"
 
-"$CCLEAN" --bogus >"$WORK/bogus.out" 2>"$WORK/bogus.err"
+cclean --bogus >"$WORK/bogus.out" 2>"$WORK/bogus.err"
 check "unknown option writes usage to stderr" 1 \
       "$(grep -c '^Usage:' "$WORK/bogus.err")"
 check "unknown option writes nothing to stdout" 0 \
       "$(wc -c < "$WORK/bogus.out" | tr -d ' ')"
 
-"$CCLEAN" --version >/dev/null 2>&1
+cclean --version >/dev/null 2>&1
 check "--version exits 0" 0 $?
 
-version=$("$CCLEAN" --version)
+version=$(cclean --version)
 check "--version names the program" "cclean" "${version%% *}"
-check "-V matches --version" "$version" "$("$CCLEAN" -V)"
+check "-V matches --version" "$version" "$(cclean -V)"
 
 # The version is written once, in CMakeLists.txt, and reaches the program as a
 # compile definition. CHANGELOG.md repeats it, so guard the pair against drift.
@@ -478,22 +516,22 @@ if [ -f "$changelog" ]; then
           "cclean $latest" "$version"
 fi
 
-"$CCLEAN" -n --no-defaults "$WORK" >/dev/null 2>&1
+cclean -n --no-defaults "$WORK" >/dev/null 2>&1
 check "--no-defaults without a pattern exits 2" 2 $?
 
-"$CCLEAN" -n --no-defaults -b "$WORK" >/dev/null 2>&1
+cclean -n --no-defaults -b "$WORK" >/dev/null 2>&1
 check "--no-defaults with -b exits 0" 0 $?
 
-"$CCLEAN" -n "$WORK/does-not-exist" >/dev/null 2>&1
+cclean -n "$WORK/does-not-exist" >/dev/null 2>&1
 check "missing root exits 1" 1 $?
 
 d=$(fixture not_a_dir)
-"$CCLEAN" -n "$d/notes.log" >/dev/null 2>&1
+cclean -n "$d/notes.log" >/dev/null 2>&1
 check "root that is not a directory exits 1" 1 $?
 
 d=$WORK/empty
 mkdir -p "$d"
-"$CCLEAN" -n "$d" >/dev/null 2>&1
+cclean -n "$d" >/dev/null 2>&1
 check "no matches exits 0" 0 $?
 
 # A directory the process cannot write to cannot have its children removed.
@@ -503,7 +541,7 @@ if unprivileged; then
     mkdir -p "$d/p/__pycache__"
     printf 'x' > "$d/p/__pycache__/a.pyc"
     chmod 555 "$d/p"
-    printf 'y' | "$CCLEAN" "$d" >/dev/null 2>&1
+    printf 'y' | cclean "$d" >/dev/null 2>&1
     check "failed removal exits 1" 1 $?
     chmod 755 "$d/p"
 else
@@ -513,8 +551,8 @@ fi
 # ------------------------------------------------------------- default root
 
 d=$(fixture bare)
-( cd "$d" && "$CCLEAN" -n . >"$WORK/bare_dot.txt" 2>&1 )
-( cd "$d" && "$CCLEAN" -n  >"$WORK/bare_none.txt" 2>&1 )
+( cd "$d" && cclean -n . >"$WORK/bare_dot.txt" 2>&1 )
+( cd "$d" && cclean -n  >"$WORK/bare_none.txt" 2>&1 )
 if cmp -s "$WORK/bare_dot.txt" "$WORK/bare_none.txt"; then
     pass
 else
@@ -531,15 +569,15 @@ printf 'c' > "$d/.ssh/id.pyc"
 printf 'd' > "$d/src/__pycache__/m.pyc"
 
 check "skip list leaves one match" "1 target, 1 B to reclaim" \
-      "$("$CCLEAN" -n "$d" | grep 'to reclaim')"
+      "$(cclean -n "$d" | grep 'to reclaim')"
 
 check "protected directories are not entered" 0 \
-      "$("$CCLEAN" -n "$d" | grep -c '\.git\|\.ssh')"
+      "$(cclean -n "$d" | grep -c '\.git\|\.ssh')"
 
 check "--no-skip enters them" 2 \
-      "$("$CCLEAN" -n --no-skip "$d" | grep -c '\.git\|\.ssh')"
+      "$(cclean -n --no-skip "$d" | grep -c '\.git\|\.ssh')"
 
-printf 'y' | "$CCLEAN" "$d" >/dev/null 2>&1
+printf 'y' | cclean "$d" >/dev/null 2>&1
 check "protected content survives removal" 1 "$(count_files "$d/.git")"
 
 # Virtual environments are walked. They are where most of a Python project's
@@ -551,9 +589,9 @@ printf 'ab' > "$d/.venv/lib/__pycache__/m.pyc"
 printf 'cd' > "$d/venv/lib/__pycache__/m.pyc"
 
 check "virtual environments are cleaned" "2 targets, 4 B to reclaim" \
-      "$("$CCLEAN" -n "$d" | grep 'to reclaim')"
+      "$(cclean -n "$d" | grep 'to reclaim')"
 
-printf 'y' | "$CCLEAN" "$d" >/dev/null 2>&1
+printf 'y' | cclean "$d" >/dev/null 2>&1
 check "virtual environment caches are removed" 0 "$(count_files "$d")"
 
 # A pattern naming a protected directory still cannot reach it.
@@ -561,7 +599,7 @@ d=$WORK/skips_explicit
 rm -rf "$d"
 mkdir -p "$d/.git/objects"
 printf 'a' > "$d/.git/objects/f"
-printf 'y' | "$CCLEAN" --no-defaults "$d" ".git" >/dev/null 2>&1
+printf 'y' | cclean --no-defaults "$d" ".git" >/dev/null 2>&1
 check "explicit pattern cannot delete a protected directory" 1 \
       "$(count_files "$d")"
 
@@ -578,14 +616,14 @@ printf 'a' > "$d/.tools/lib/foo_cache/pkg.py"
 printf 'b' > "$d/.ruff_cache/entry"
 
 check "built-in pattern does not match by path" 0 \
-      "$("$CCLEAN" -n "$d" | grep -c 'foo_cache')"
+      "$(cclean -n "$d" | grep -c 'foo_cache')"
 check "built-in pattern matches by name" 1 \
-      "$("$CCLEAN" -n "$d" | grep -c 'ruff_cache')"
+      "$(cclean -n "$d" | grep -c 'ruff_cache')"
 
 # The same pattern supplied on the command line is also path-scoped, and does
 # match. The scope is the only difference between the two cases.
 check "supplied pattern matches by path" 1 \
-      "$("$CCLEAN" -n --no-defaults "$d" ".*_cache" | grep -c 'foo_cache')"
+      "$(cclean -n --no-defaults "$d" ".*_cache" | grep -c 'foo_cache')"
 
 # ------------------------------------------------------------- symlinks
 
@@ -597,9 +635,9 @@ ln -s real/big.dat "$d/link.pyc"
 ln -s real "$d/dir.pyc"
 
 check "symlink counts as zero bytes" 1 \
-      "$("$CCLEAN" -n "$d" | grep -c 'link.pyc  0 B')"
+      "$(cclean -n "$d" | grep -c 'link.pyc  0 B')"
 
-printf 'y' | "$CCLEAN" "$d" >/dev/null 2>&1
+printf 'y' | cclean "$d" >/dev/null 2>&1
 check "symlink target survives" 1 "$(count_files "$d/real")"
 check "symlink itself is removed" 0 "$(ls "$d" | grep -c 'link.pyc')"
 
@@ -618,16 +656,16 @@ for p in cmake/build cargo/target no_git/build no_marker/build stray/build; do
 done
 
 check "artifacts are not removed by default" 0 \
-      "$("$CCLEAN" -n "$d" | grep -c 'build/\|target/')"
+      "$(cclean -n "$d" | grep -c 'build/\|target/')"
 
 check "-b finds exactly the two real projects" "2 targets, 4 B to reclaim" \
-      "$("$CCLEAN" -n -b "$d" | grep 'to reclaim')"
+      "$(cclean -n -b "$d" | grep 'to reclaim')"
 
-check "-b requires .git" 0 "$("$CCLEAN" -n -b "$d" | grep -c 'no_git')"
-check "-b requires a marker file" 0 "$("$CCLEAN" -n -b "$d" | grep -c 'no_marker')"
-check "-b ignores unmarked directories" 0 "$("$CCLEAN" -n -b "$d" | grep -c 'stray')"
+check "-b requires .git" 0 "$(cclean -n -b "$d" | grep -c 'no_git')"
+check "-b requires a marker file" 0 "$(cclean -n -b "$d" | grep -c 'no_marker')"
+check "-b ignores unmarked directories" 0 "$(cclean -n -b "$d" | grep -c 'stray')"
 
-printf 'y' | "$CCLEAN" -b "$d" >/dev/null 2>&1
+printf 'y' | cclean -b "$d" >/dev/null 2>&1
 check "-b removes the build directory" 0 "$(count_files "$d/cmake/build")"
 check "-b leaves the marker file" 1 "$(count_files "$d/cmake" | tr -d ' ')"
 
@@ -642,33 +680,33 @@ printf 'cc' > "$d/tests/fixtures/__pycache__/m.pyc"
 printf 'd' > "$d/top.pyc"
 
 check "no excludes matches everything" "4 targets, 7 B to reclaim" \
-      "$("$CCLEAN" -n "$d" | grep 'to reclaim')"
+      "$(cclean -n "$d" | grep 'to reclaim')"
 
 # An exclude prunes, so naming a directory keeps everything under it. This is
 # how a virtual environment is protected now that the built-in list does not.
 check "--exclude prunes the subtree" 0 \
-      "$("$CCLEAN" -n "$d" -e .venv | grep -c 'venv')"
+      "$(cclean -n "$d" -e .venv | grep -c 'venv')"
 check "--exclude=VALUE form" 0 \
-      "$("$CCLEAN" -n "$d" --exclude=.venv | grep -c 'venv')"
+      "$(cclean -n "$d" --exclude=.venv | grep -c 'venv')"
 check "-e prunes a nested subtree" 0 \
-      "$("$CCLEAN" -n "$d" -e tests | grep -c 'fixtures')"
+      "$(cclean -n "$d" -e tests | grep -c 'fixtures')"
 # "*.pyc" excludes top.pyc; src/__pycache__ is claimed whole and its name
 # does not end in .pyc, so it survives the exclude and its 2 bytes remain.
 check "-e is repeatable" "1 target, 2 B to reclaim" \
-      "$("$CCLEAN" -n "$d" -e .venv -e tests -e "*.pyc" | grep 'to reclaim')"
+      "$(cclean -n "$d" -e .venv -e tests -e "*.pyc" | grep 'to reclaim')"
 check "-e excludes a file" 0 \
-      "$("$CCLEAN" -n --no-defaults "$d" "*.pyc" -e top.pyc | grep -c 'top.pyc')"
+      "$(cclean -n --no-defaults "$d" "*.pyc" -e top.pyc | grep -c 'top.pyc')"
 
-"$CCLEAN" -n "$d" -e >/dev/null 2>&1
+cclean -n "$d" -e >/dev/null 2>&1
 check "-e without a pattern exits 2" 2 $?
-"$CCLEAN" -n "$d" --exclude >/dev/null 2>&1
+cclean -n "$d" --exclude >/dev/null 2>&1
 check "--exclude without a pattern exits 2" 2 $?
 
 # The value is taken verbatim, so it may itself begin with a dash.
-"$CCLEAN" -n "$d" -e "-weird" >/dev/null 2>&1
+cclean -n "$d" -e "-weird" >/dev/null 2>&1
 check "-e takes a dashed value verbatim" 0 $?
 
-printf 'y' | "$CCLEAN" "$d" -e .venv >/dev/null 2>&1
+printf 'y' | cclean "$d" -e .venv >/dev/null 2>&1
 check "excluded content survives removal" 1 "$(count_files "$d/.venv")"
 
 # ------------------------------------------------------- build ecosystems
@@ -701,15 +739,15 @@ mkdir -p "$d/crossed/.git" "$d/crossed/target" && printf 'x' > "$d/crossed/packa
 printf 'yy' > "$d/crossed/target/out"
 
 check "artifacts need -b" 0 \
-      "$("$CCLEAN" -n "$d" | grep -c 'out\|dist\|_build\|zig-out')"
+      "$(cclean -n "$d" | grep -c 'out\|dist\|_build\|zig-out')"
 
 check "-b finds every ecosystem and no others" "16 targets, 32 B to reclaim" \
-      "$("$CCLEAN" -n -b "$d" | grep 'to reclaim')"
+      "$(cclean -n -b "$d" | grep 'to reclaim')"
 
-check "-b requires .git" 0 "$("$CCLEAN" -n -b "$d" | grep -c 'nogit')"
-check "-b requires a marker" 0 "$("$CCLEAN" -n -b "$d" | grep -c 'nomarker')"
+check "-b requires .git" 0 "$(cclean -n -b "$d" | grep -c 'nogit')"
+check "-b requires a marker" 0 "$(cclean -n -b "$d" | grep -c 'nomarker')"
 check "-b pairs the marker with its own directory" 0 \
-      "$("$CCLEAN" -n -b "$d" | grep -c 'crossed')"
+      "$(cclean -n -b "$d" | grep -c 'crossed')"
 
 # A submodule carries its own .git and marker file. Its build output is not
 # top-level in the project being cleaned, so it must not match. This is the
@@ -729,22 +767,22 @@ printf 'x' > "$d/outer/third_party/lib/CMakeLists.txt"
 printf 'CCCCCC' > "$d/outer/third_party/lib/build/out"
 
 check "only the top-level build matches" "1 target, 2 B to reclaim" \
-      "$("$CCLEAN" -n -b "$d" | grep 'to reclaim')"
+      "$(cclean -n -b "$d" | grep 'to reclaim')"
 check "a submodule build does not match" 0 \
-      "$("$CCLEAN" -n -b "$d" | grep -c 'vendored')"
+      "$(cclean -n -b "$d" | grep -c 'vendored')"
 check "a nested checkout build does not match" 0 \
-      "$("$CCLEAN" -n -b "$d" | grep -c 'third_party')"
+      "$(cclean -n -b "$d" | grep -c 'third_party')"
 
 # Naming the nested project as ROOT makes its build top-level again.
 check "the nested build matches when named as ROOT" "1 target, 4 B to reclaim" \
-      "$("$CCLEAN" -n -b "$d/outer/lib/vendored" | grep 'to reclaim')"
+      "$(cclean -n -b "$d/outer/lib/vendored" | grep 'to reclaim')"
 
 # ROOT inside the repository still cleans that repository's own build.
 check "ROOT at the project cleans its build" "1 target, 2 B to reclaim" \
-      "$("$CCLEAN" -n -b "$d/outer" | grep 'to reclaim')"
+      "$(cclean -n -b "$d/outer" | grep 'to reclaim')"
 
 check "--exclude applies to artifacts too" 0 \
-      "$("$CCLEAN" -n -b "$d" -e "**/next/**" -e next | grep -c '/next/')"
+      "$(cclean -n -b "$d" -e "**/next/**" -e next | grep -c '/next/')"
 
 # ----------------------------------------------------------- output shape
 
@@ -752,30 +790,30 @@ d=$(fixture output)
 
 # Escape sequences must not reach a pipe or a file.
 check "no colour when redirected" 0 \
-      "$("$CCLEAN" -n "$d" | grep -c "$(printf '\033')")"
+      "$(cclean -n "$d" | grep -c "$(printf '\033')")"
 
 # Progress is drawn on standard error, and only for a terminal.
-"$CCLEAN" -n "$d" >/dev/null 2>"$WORK/err.txt"
+cclean -n "$d" >/dev/null 2>"$WORK/err.txt"
 check "no progress when stderr is a file" 0 "$(wc -c < "$WORK/err.txt" | tr -d ' ')"
 
 check "NO_COLOR is honoured" 0 \
-      "$(NO_COLOR=1 "$CCLEAN" -n "$d" | grep -c "$(printf '\033')")"
+      "$(NO_COLOR=1 cclean -n "$d" | grep -c "$(printf '\033')")"
 
 # --color is the more specific instruction: it decides for the run, over both
 # the terminal check and the environment.
 check "--color=always colours a pipe" yes \
-      "$(NO_COLOR=1 "$CCLEAN" --color=always -n "$d" | coloured)"
+      "$(NO_COLOR=1 cclean --color=always -n "$d" | coloured)"
 check "--color=never leaves a terminal plain" no \
-      "$("$CCLEAN" --color=never -n "$d" | coloured)"
+      "$(cclean --color=never -n "$d" | coloured)"
 check "--color WHEN takes a separate argument" yes \
-      "$("$CCLEAN" --color always -n "$d" | coloured)"
+      "$(cclean --color always -n "$d" | coloured)"
 check "--color=auto matches the default" no \
-      "$("$CCLEAN" --color=auto -n "$d" | coloured)"
+      "$(cclean --color=auto -n "$d" | coloured)"
 
-"$CCLEAN" --color=purple -n "$d" >/dev/null 2>&1
+cclean --color=purple -n "$d" >/dev/null 2>&1
 check "unknown colour setting exits 2" 2 $?
 
-"$CCLEAN" --color >/dev/null 2>&1
+cclean --color >/dev/null 2>&1
 check "--color without a setting exits 2" 2 $?
 
 # ------------------------------------------------------ argument handling
@@ -785,17 +823,17 @@ rm -rf "$d"
 mkdir -p "$d"
 printf 'x' > "$d/--no-skip"
 check "-- ends option parsing" 1 \
-      "$("$CCLEAN" -n --no-defaults "$d" -- "--no-skip" | grep -c 'no-skip')"
+      "$(cclean -n --no-defaults "$d" -- "--no-skip" | grep -c 'no-skip')"
 
 # Every argument after ROOT is still a pattern, not a path to walk.
 d=$(fixture patterns)
 check "command line pattern is added to the defaults" \
       "4 targets, 17 B to reclaim" \
-      "$("$CCLEAN" -n "$d" "*.log" | grep 'to reclaim')"
+      "$(cclean -n "$d" "*.log" | grep 'to reclaim')"
 
 # A pattern that cannot be a valid regular expression must not abort. An
 # earlier build died with an uncaught regex_error here.
-"$CCLEAN" -n --no-defaults "$d" "****a" >/dev/null 2>&1
+cclean -n --no-defaults "$d" "****a" >/dev/null 2>&1
 check "pathological pattern does not abort" 0 $?
 
 # --------------------------------------------------- numeric filter limits
@@ -812,32 +850,32 @@ mkdir -p "$d"
 printf 'x' > "$d/one.pyc"
 
 check "--larger-than at the maximum matches nothing" 0 \
-      "$("$CCLEAN" -n --larger-than 18446744073709551615B "$d" | grep -c 'one.pyc')"
+      "$(cclean -n --larger-than 18446744073709551615B "$d" | grep -c 'one.pyc')"
 check "--older-than at the maximum matches nothing" 0 \
-      "$("$CCLEAN" -n --older-than 9223372036854775807s "$d" | grep -c 'one.pyc')"
+      "$(cclean -n --older-than 9223372036854775807s "$d" | grep -c 'one.pyc')"
 
-"$CCLEAN" -n --larger-than 18446744073709551616B "$d" >/dev/null 2>&1
+cclean -n --larger-than 18446744073709551616B "$d" >/dev/null 2>&1
 check "--larger-than past the maximum is rejected" 2 $?
-"$CCLEAN" -n --older-than 9223372036854775808s "$d" >/dev/null 2>&1
+cclean -n --older-than 9223372036854775808s "$d" >/dev/null 2>&1
 check "--older-than past the maximum is rejected" 2 $?
-"$CCLEAN" -n --larger-than 16777216T "$d" >/dev/null 2>&1
+cclean -n --larger-than 16777216T "$d" >/dev/null 2>&1
 check "--larger-than overflowing through its unit is rejected" 2 $?
 
 check "--larger-than 0B matches" 1 \
-      "$("$CCLEAN" -n --larger-than 0B "$d" | grep -c 'one.pyc')"
+      "$(cclean -n --larger-than 0B "$d" | grep -c 'one.pyc')"
 check "--larger-than 1B matches a one byte file" 1 \
-      "$("$CCLEAN" -n --larger-than 1B "$d" | grep -c 'one.pyc')"
+      "$(cclean -n --larger-than 1B "$d" | grep -c 'one.pyc')"
 check "--larger-than 2B does not" 0 \
-      "$("$CCLEAN" -n --larger-than 2B "$d" | grep -c 'one.pyc')"
+      "$(cclean -n --larger-than 2B "$d" | grep -c 'one.pyc')"
 
 printf '%2048s' '' > "$d/two.pyc"
 check "fractional size is exact" 1 \
-      "$("$CCLEAN" -n --larger-than 1.5K "$d" | grep -c 'two.pyc')"
+      "$(cclean -n --larger-than 1.5K "$d" | grep -c 'two.pyc')"
 check "fractional size rounds toward zero, not up" 0 \
-      "$("$CCLEAN" -n --larger-than 2.5K "$d" | grep -c 'two.pyc')"
+      "$(cclean -n --larger-than 2.5K "$d" | grep -c 'two.pyc')"
 
 for bad in 1e3d -1d .d 1.2.3d; do
-    "$CCLEAN" -n --older-than "$bad" "$d" >/dev/null 2>&1
+    cclean -n --older-than "$bad" "$d" >/dev/null 2>&1
     check "--older-than $bad is rejected" 2 $?
 done
 
@@ -859,25 +897,25 @@ d=$(marker_fixture regular)
 mkdir "$d/proj/.git"
 printf 'x' > "$d/proj/CMakeLists.txt"
 check "a regular marker file matches" 1 \
-      "$("$CCLEAN" -b -n "$d" | grep -c 'build')"
+      "$(cclean -b -n "$d" | grep -c 'build')"
 
 d=$(marker_fixture directory)
 mkdir "$d/proj/.git" "$d/proj/CMakeLists.txt"
 check "a directory named like the marker does not" 0 \
-      "$("$CCLEAN" -b -n "$d" | grep -c 'build')"
+      "$(cclean -b -n "$d" | grep -c 'build')"
 
 d=$(marker_fixture symlink)
 mkdir "$d/proj/.git"
 printf 'x' > "$d/outside"
 ln -s "$d/outside" "$d/proj/CMakeLists.txt"
 check "a symlinked marker does not" 0 \
-      "$("$CCLEAN" -b -n "$d" | grep -c 'build')"
+      "$(cclean -b -n "$d" | grep -c 'build')"
 
 d=$(marker_fixture broken)
 mkdir "$d/proj/.git"
 ln -s "$d/nowhere" "$d/proj/CMakeLists.txt"
 check "a broken symlink marker does not" 0 \
-      "$("$CCLEAN" -b -n "$d" | grep -c 'build')"
+      "$(cclean -b -n "$d" | grep -c 'build')"
 
 # A submodule or a linked worktree carries a .git file rather than a
 # directory, and both name a real repository.
@@ -885,20 +923,20 @@ d=$(marker_fixture gitfile)
 printf 'gitdir: ../.git/modules/proj\n' > "$d/proj/.git"
 printf 'x' > "$d/proj/CMakeLists.txt"
 check "a .git file counts as a repository" 1 \
-      "$("$CCLEAN" -b -n "$d" | grep -c 'build')"
+      "$(cclean -b -n "$d" | grep -c 'build')"
 
 d=$(marker_fixture gitlink)
 ln -s "$d/elsewhere" "$d/proj/.git"
 printf 'x' > "$d/proj/CMakeLists.txt"
 check "a symlinked .git does not" 0 \
-      "$("$CCLEAN" -b -n "$d" | grep -c 'build')"
+      "$(cclean -b -n "$d" | grep -c 'build')"
 
 if command -v mkfifo >/dev/null 2>&1; then
     d=$(marker_fixture fifo)
     mkdir "$d/proj/.git"
     mkfifo "$d/proj/CMakeLists.txt"
     check "a FIFO named like the marker does not" 0 \
-          "$("$CCLEAN" -b -n "$d" | grep -c 'build')"
+          "$(cclean -b -n "$d" | grep -c 'build')"
 fi
 
 # ------------------------------------------------------- symlink timestamps
@@ -914,11 +952,11 @@ printf 'x' > "$d/fresh.txt"
 ln -s fresh.txt "$d/old.pyc"
 touch -h -d '2001-01-01T00:00:00' "$d/old.pyc"
 check "an old link to a fresh file is old" 1 \
-      "$("$CCLEAN" -n --older-than 1d "$d" | grep -c 'old.pyc')"
+      "$(cclean -n --older-than 1d "$d" | grep -c 'old.pyc')"
 
 ln -s fresh.txt "$d/new.pyc"
 check "a fresh link is not old" 0 \
-      "$("$CCLEAN" -n --older-than 1d "$d" | grep -c 'new.pyc')"
+      "$(cclean -n --older-than 1d "$d" | grep -c 'new.pyc')"
 
 # ------------------------------------------------------------ hostile names
 #
@@ -933,19 +971,19 @@ touch "$d/$(printf 'esc\033[2Kwipe').pyc"
 touch "$d/$(printf 'ret\ril').pyc"
 
 check "a newline in a name is escaped" 0 \
-      "$("$CCLEAN" -n "$d" | grep -c '^lines.pyc')"
+      "$(cclean -n "$d" | grep -c '^lines.pyc')"
 check "an escape character never reaches the terminal" 0 \
-      "$(NO_COLOR=1 "$CCLEAN" -n "$d" | grep -c "$(printf '\033')")"
+      "$(NO_COLOR=1 cclean -n "$d" | grep -c "$(printf '\033')")"
 check "a carriage return never reaches the terminal" 0 \
-      "$(NO_COLOR=1 "$CCLEAN" -n "$d" | grep -c "$(printf '\r')")"
+      "$(NO_COLOR=1 cclean -n "$d" | grep -c "$(printf '\r')")"
 check "the escaped names are still all listed" 3 \
-      "$("$CCLEAN" -n "$d" | grep -c '\.pyc')"
+      "$(cclean -n "$d" | grep -c '\.pyc')"
 
 # JSON is defined over text, so one undecodable byte in one name used to make
 # the whole document unparseable, totals and warnings included.
 if command -v python3 >/dev/null 2>&1; then
     touch "$d/$(printf 'bad\377').pyc"
-    "$CCLEAN" -n --format json "$d" 2>/dev/null > "$WORK/names.json"
+    cclean -n --format json "$d" 2>/dev/null > "$WORK/names.json"
     python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$WORK/names.json" \
         >/dev/null 2>&1
     check "json output stays decodable next to an invalid name" 0 $?
@@ -962,7 +1000,7 @@ config_run() {
     mkdir -p "$d"
     printf 'x' > "$d/f.tmp"
     printf '%s\n' "$1" > "$d/.cclean.toml"
-    "$CCLEAN" -n "$d" >/dev/null 2>&1
+    cclean -n "$d" >/dev/null 2>&1
     echo $?
 }
 
@@ -1083,27 +1121,39 @@ printf 'patterns = ["*.tmp"]\n' > "$d/.cclean.toml"
 printf 'patterns = ["*.nomatch"]\n' > "$WORK/other.toml"
 
 check "discovered config applies" 1 \
-      "$("$CCLEAN" -n "$d/nested" | grep -c 'keep.tmp')"
+      "$(cclean -n "$d/nested" | grep -c 'keep.tmp')"
 check "--no-config ignores the discovered file" 0 \
-      "$("$CCLEAN" -n --no-config "$d/nested" | grep -c 'keep.tmp')"
+      "$(cclean -n --no-config "$d/nested" | grep -c 'keep.tmp')"
 check "--config replaces the discovered file" 0 \
-      "$("$CCLEAN" -n --config "$WORK/other.toml" "$d/nested" | \
+      "$(cclean -n --config "$WORK/other.toml" "$d/nested" | \
          grep -c 'keep.tmp')"
 check "--config=FILE is the same option" 0 \
-      "$("$CCLEAN" -n --config="$WORK/other.toml" "$d/nested" | \
+      "$(cclean -n --config="$WORK/other.toml" "$d/nested" | \
          grep -c 'keep.tmp')"
 
-"$CCLEAN" -n --config "$WORK/missing.toml" "$d" >/dev/null 2>&1
+cclean -n --config "$WORK/missing.toml" "$d" >/dev/null 2>&1
 check "--config on a missing file exits 2" 2 $?
-"$CCLEAN" -n --config "$WORK/other.toml" --no-config "$d" >/dev/null 2>&1
+
+# An empty value used to be indistinguishable from the option being absent,
+# so it fell through to the upward search and loaded the ancestor file that
+# naming a config outright is meant to rule out.
+cclean -n --config= "$d/nested" >/dev/null 2>&1
+check "--config= exits 2" 2 $?
+
+cclean -n --config "" "$d/nested" >/dev/null 2>&1
+check "--config with an empty value exits 2" 2 $?
+
+check "--config= does not fall back to the discovered file" 0 \
+      "$(cclean -n --config= "$d/nested" 2>/dev/null | grep -c 'keep.tmp')"
+cclean -n --config "$WORK/other.toml" --no-config "$d" >/dev/null 2>&1
 check "--config with --no-config exits 2" 2 $?
 
 # Which file supplied the settings is otherwise invisible.
 check "--verbose names the config" 1 \
-      "$("$CCLEAN" -n -v "$d/nested" 2>&1 >/dev/null | \
+      "$(cclean -n -v "$d/nested" 2>&1 >/dev/null | \
          grep -c 'Configuration: .*\.cclean\.toml')"
 check "--no-config names nothing" 0 \
-      "$("$CCLEAN" -n -v --no-config "$d/nested" 2>&1 >/dev/null | \
+      "$(cclean -n -v --no-config "$d/nested" 2>&1 >/dev/null | \
          grep -c 'Configuration:')"
 
 # ------------------------------------------------- second root as a pattern
@@ -1118,15 +1168,15 @@ mkdir -p "$d/a/__pycache__" "$d/b"
 printf 'x' > "$d/a/__pycache__/m.pyc"
 
 check "a second directory operand is noted" 1 \
-      "$("$CCLEAN" -n "$d/a" "$d/b" 2>&1 >/dev/null | grep -c 'not as a second root')"
+      "$(cclean -n "$d/a" "$d/b" 2>&1 >/dev/null | grep -c 'not as a second root')"
 check "the note does not reach stdout" 0 \
-      "$("$CCLEAN" -n "$d/a" "$d/b" 2>/dev/null | grep -c 'second root')"
+      "$(cclean -n "$d/a" "$d/b" 2>/dev/null | grep -c 'second root')"
 check "a name existing under ROOT is noted" 1 \
-      "$("$CCLEAN" -n "$d" b 2>&1 >/dev/null | grep -c 'not as a second root')"
+      "$(cclean -n "$d" b 2>&1 >/dev/null | grep -c 'not as a second root')"
 check "a wildcard pattern is not noted" 0 \
-      "$("$CCLEAN" -n "$d" 'b*' 2>&1 >/dev/null | grep -c 'not as a second root')"
+      "$(cclean -n "$d" 'b*' 2>&1 >/dev/null | grep -c 'not as a second root')"
 check "a pattern naming nothing is not noted" 0 \
-      "$("$CCLEAN" -n "$d" zzz 2>&1 >/dev/null | grep -c 'not as a second root')"
+      "$(cclean -n "$d" zzz 2>&1 >/dev/null | grep -c 'not as a second root')"
 
 # ------------------------------------------------------ restore commands
 #
@@ -1142,14 +1192,14 @@ printf 'x' > "$d/conf/mix.exs"
 printf 'dependency_markers = [["deps", "mix.exs"]]\n' > "$d/.cclean.toml"
 
 check "npm ci is reported for a locked node_modules" 1 \
-      "$("$CCLEAN" -n -d "$d" | grep -c 'node_modules/.*restore: npm ci')"
+      "$(cclean -n -d "$d" | grep -c 'node_modules/.*restore: npm ci')"
 check "go mod vendor is reported for a vendor tree" 1 \
-      "$("$CCLEAN" -n -d "$d" | grep -c 'vendor/.*restore: go mod vendor')"
+      "$(cclean -n -d "$d" | grep -c 'vendor/.*restore: go mod vendor')"
 # A configured pair carries no restore command: only the user knows it.
 check "a configured pair reports no restore" 0 \
-      "$("$CCLEAN" -n -d "$d" | grep -c 'deps/.*restore')"
+      "$(cclean -n -d "$d" | grep -c 'deps/.*restore')"
 check "the JSON carries the restore command" 1 \
-      "$("$CCLEAN" -n -d --format json "$d" | grep -c '"restore": "npm ci"')"
+      "$(cclean -n -d --format json "$d" | grep -c '"restore": "npm ci"')"
 
 # ---------------------------------------------------------- JSON contract
 
@@ -1160,16 +1210,22 @@ printf 'x' > "$d/pkg/m.pyc"
 ln -s /nonexistent "$d/dangling.pyc"
 
 check "the document reports its schema" 1 \
-      "$("$CCLEAN" -n --format json "$d" | grep -c '"schema": 1')"
+      "$(cclean -n --format json "$d" | grep -c '"schema": 1')"
 # A matched symlink is unlinked without being followed and frees no contents,
 # which is exactly why a consumer must be able to tell it from a file.
 check "a symlink reports its own type" 1 \
-      "$("$CCLEAN" -n --format json "$d" | \
+      "$(cclean -n --format json "$d" | \
          grep -c 'dangling.pyc", "type": "symlink"')"
 check "a file still reports file" 1 \
-      "$("$CCLEAN" -n --format json "$d" | grep -c '"type": "file"')"
+      "$(cclean -n --format json "$d" | grep -c '"type": "file"')"
 check "config is null when none was read" 1 \
-      "$("$CCLEAN" -n --format json --no-config "$d" | grep -c '"config": null')"
+      "$(cclean -n --format json --no-config "$d" | grep -c '"config": null')"
+
+# The wrapper records any status outside the documented set. Nothing above
+# asserts on these, because the point is that they can happen anywhere.
+check "no run exited with an undocumented status" 0 \
+      "$(wc -l < "$UNDOCUMENTED" | tr -d ' ')"
+[ -s "$UNDOCUMENTED" ] && cat "$UNDOCUMENTED" >&2
 
 # ------------------------------------------------------------------ result
 

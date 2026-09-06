@@ -22,30 +22,39 @@ BUILD_TYPE ?= Release
 # checksum over the sources decides instead, and a mismatch cleans the tree
 # before building. cksum is POSIX, so this needs nothing that CMake does not
 # already require.
-SOURCES := $(shell find include src cli tests -type f 2>/dev/null | sort) \
-           CMakeLists.txt
+#
+# The list is built by find inside the recipe rather than by $(shell), so that
+# a source path holding a space stays one argument: `-exec cksum {} +` passes
+# the names to cksum directly, where a word-split expansion had made two
+# arguments of one path. Sorting the checksum lines rather than the names
+# keeps the result independent of the order find walks the tree in, and needs
+# neither `sort -z` nor `xargs -0`, which are not POSIX.
 STAMP = $(BUILD)/.source-checksum
 
 .PHONY: all build test install clean
 
 all: build
 
+# $(BUILD) and $(PREFIX) come from the command line and are quoted everywhere
+# they are expanded: an unquoted path holding a space became two arguments and
+# the cmake invocation failed with a usage message.
 build:
-	@cmake -S . -B $(BUILD) \
-		-DCMAKE_BUILD_TYPE=$(BUILD_TYPE) \
-		-DCMAKE_INSTALL_PREFIX=$(PREFIX)
-	@checksum=$$(cksum $(SOURCES) | cksum); \
-	if [ ! -f $(STAMP) ] || [ "$$checksum" != "$$(cat $(STAMP))" ]; then \
-		cmake --build $(BUILD) --target clean; \
+	@cmake -S . -B "$(BUILD)" \
+		-DCMAKE_BUILD_TYPE="$(BUILD_TYPE)" \
+		-DCMAKE_INSTALL_PREFIX="$(PREFIX)"
+	@checksum=$$(find include src cli tests CMakeLists.txt -type f \
+		-exec cksum {} + 2>/dev/null | sort | cksum); \
+	if [ ! -f "$(STAMP)" ] || [ "$$checksum" != "$$(cat "$(STAMP)")" ]; then \
+		cmake --build "$(BUILD)" --target clean; \
 	fi; \
-	cmake --build $(BUILD) --parallel && \
-	printf '%s\n' "$$checksum" > $(STAMP)
+	cmake --build "$(BUILD)" --parallel && \
+	printf '%s\n' "$$checksum" > "$(STAMP)"
 
 test: build
-	@ctest --test-dir $(BUILD) --output-on-failure
+	@ctest --test-dir "$(BUILD)" --output-on-failure
 
 install: build
-	@cmake --install $(BUILD) --strip
+	@cmake --install "$(BUILD)" --strip
 
 clean:
-	@rm -rf $(BUILD)
+	@rm -rf "$(BUILD)"

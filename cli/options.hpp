@@ -25,7 +25,9 @@ struct CommandLine {
 
     std::string older_than;
     std::string larger_than;
-    // Empty unless --config was given; `no_config` is --no-config.
+    // Empty exactly when --config was not given: an empty value is rejected
+    // at the parse, because main() reads empty as "search upward from ROOT".
+    // `no_config` is --no-config.
     std::string config_path;
     bool no_config = false;
     std::vector<std::string> excludes;

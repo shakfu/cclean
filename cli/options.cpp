@@ -191,8 +191,15 @@ bool parse_command_line(
                 continue;
             }
 
+            // An empty path is rejected here rather than carried through,
+            // because main() reads an empty config_path as "none was given"
+            // and searches upward from ROOT: `--config=` would then load an
+            // ancestor .cclean.toml, which is the one thing naming a config
+            // file explicitly is for ruling out. Rejecting it at the parse
+            // means the value alone still says whether the option appeared,
+            // so this needs no set_ flag of its own.
             if (argument == "--config") {
-                if (i + 1 >= argc) {
+                if (i + 1 >= argc || argv[i + 1][0] == '\0') {
                     std::cerr << argument << " needs a file.\n";
                     status = 2;
                     return false;
@@ -203,6 +210,12 @@ bool parse_command_line(
             }
 
             if (argument.rfind("--config=", 0) == 0) {
+                if (argument.size() == 9) {
+                    std::cerr << "--config needs a file.\n";
+                    status = 2;
+                    return false;
+                }
+
                 command_line.config_path = argument.substr(9);
                 continue;
             }

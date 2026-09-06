@@ -12,11 +12,33 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 - The README said an unreadable directory makes the command exit with status 1. The exit-code table two sections above it already gave that case status 3, which is what the program does; a script following the later sentence would have read an incomplete scan as a failed removal. The comment in `src/json.cpp` said the same thing and would have reintroduced the confusion during maintenance.
 
+- `--config=` and `--config ""` loaded a configuration file instead of failing. `main()` reads an empty `config_path` as "no file was named" and searches upward from `ROOT`, so an explicitly empty value fell through to the ancestor `.cclean.toml` that naming a file outright exists to rule out. Both forms now exit 2. The value is rejected at the parse rather than tracked by a `set_config` flag alongside the other options, which keeps the invariant that `config_path` is non-empty exactly when the option was given.
+
+- `make BUILD="out dir"` and `make PREFIX="$HOME/my prefix"` failed. Both were expanded into the cmake command lines unquoted, so a path holding a space became two arguments and cmake answered with its usage text instead of configuring. Every expansion of `$(BUILD)`, `$(PREFIX)` and `$(STAMP)` is now quoted.
+
+- The source checksum split on the same paths. `$(shell find ...)` produced a word-split list, so a source path holding a space reached `cksum` as two names. The list is built inside the recipe with `find ... -exec cksum {} +`, which passes the names directly, and the checksum lines are sorted rather than the filenames: that keeps the result independent of the order find walks the tree in and needs neither `sort -z` nor `xargs -0`, neither of which is POSIX.
+
+- 18 of the command-line checks failed when the binary's path held a space, because `$CCLEAN` was unquoted at 28 call sites inside command substitutions. The failure was unreachable until now: `make` could not configure a build directory with a space in its name, so no such binary existed to hand the suite.
+
 ### Changed
 
 - `Target` carries `device`, `inode` and `has_identity`, widened to `std::uint64_t` so that no POSIX type appears in a public header. Existing code that constructs a `Target` continues to compile and to be removed as before.
 
 - Scanning and ordinary deletion are unchanged: over the 70,000-entry tree with 1,200 targets, a dry run takes the same 28 ms and a full run the same 76 ms it did before. The identity check costs one `lstat` per matched target during the scan, and the overlap pass costs a sort of the list, so both scale with the number of targets rather than the size of the tree; over a list of 20,000 targets a full run goes from 221 ms to 227 ms. Two-thirds of that had been the overlap pass alone, and is gone: a path that came from the scan is already lexically normal, which one read of the string decides more cheaply than rebuilding it, and a list that is already sorted -- which is what `scan()` returns -- is detected in a linear pass rather than sorted again.
+
+- The command-line suite runs the binary through a `cclean` shell function rather than naming `$CCLEAN` directly. Most of its assertions read output through a pipeline or a command substitution: the first reports the status of `grep` and not of the program, the second runs in a subshell that cannot reach the pass and fail counters, so a crash that still printed the expected line was scored as a pass. The function records any status outside the documented 0, 1, 2 and 3 in a file, which a subshell can write and one check at the end of the suite reads. It returns the status unchanged, so the 30-odd `exits N` assertions still assert what they did.
+
+- Nothing on the scanning or removal path changed. Every object in `cclean_core`, and `cli/main.cpp.o`, is byte-identical to the `770fc75` build; only `cli/options.cpp.o` differs. 20 dry runs over a 60,001-entry tree measure within noise of the previous build, 1.73 s against 1.75 s, and the added parse work is one comparison on a run that passes `--config`.
+
+### Added
+
+- Timeouts on both suites, 120 seconds for `unit` and 300 for `cli`, and `timeout-minutes` on every CI job. Neither test had one, so a worker-pool deadlock or a prompt reading a stdin nothing closes ran until GitHub's six-hour job limit rather than failing. The budgets are set for both suites under ThreadSanitizer on a Debug build, not for the 0.06 and 1.6 seconds they take locally, so a timeout means a hang and not a slow runner.
+
+- A CI job that builds, tests and installs through `make`, with a build directory and an install prefix whose names contain a space. The other jobs drive cmake directly, so nothing covered the Makefile: neither its quoting nor the checksum guard that exists because CMake compares mtimes at one-second granularity. The job asserts that appending to a source changes the stamp, which is the case an mtime comparison misses, and that the installed tree carries the binary, the archive and the headers.
+
+- Command-line coverage for the empty `--config` value in both spellings, for the discovered file it must no longer fall back to, and for the exit status of the two runs whose output the size and reason-breakdown assertions read through a pipeline. The suite goes from 211 checks to 218.
+
+- A README limitation recording that the scan is not descriptor-relative the way deletion is. It queues directory paths and opens each by path, so a directory that passed the no-follow check and was replaced by a symlink before the walk or the sizing pass reached it is followed that once, and the list and the byte totals can then name entries from outside `ROOT`. Nothing is removed through it: the walk down from `ROOT` opens every component with `O_NOFOLLOW` and refuses the changed one. Recorded rather than fixed, because descriptor-relative traversal would hold one open descriptor per queued directory and the queue grows to the width of the tree.
 
 ## [0.2.1]
 

@@ -23,6 +23,9 @@ jobs:
             cc: clang
             cxx: clang++
     runs-on: ${{ matrix.os }}
+    # The ctest timeouts fail a hung suite; this bounds everything else, since
+    # a job that hangs outside ctest runs for GitHub's six-hour default.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - name: Configure
@@ -49,6 +52,8 @@ jobs:
       matrix:
         sanitizer: ["address,undefined", "thread"]
     runs-on: ubuntu-latest
+    # Instrumented builds are slower than the ordinary one on both counts.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
       - name: Configure
@@ -67,3 +72,33 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
           TSAN_OPTIONS: halt_on_error=1
         run: setarch -R ctest --test-dir build --output-on-failure
+
+  # The jobs above drive cmake directly, so nothing exercised the Makefile:
+  # neither its checksum guard against a stale binary nor the quoting of the
+  # paths it is given. Both run here, through a build directory and an install
+  # prefix whose names contain a space.
+  make:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and test through a path with a space
+        run: make test BUILD="out dir"
+      - name: Install to a prefix with a space
+        run: make install BUILD="out dir" PREFIX="$PWD/install prefix"
+      - name: Check the installed tree
+        run: |
+          test -x "$PWD/install prefix/bin/cclean"
+          test -f "$PWD/install prefix/lib/libcclean.a"
+          test -f "$PWD/install prefix/include/cclean/cclean.hpp"
+          "$PWD/install prefix/bin/cclean" --version
+      # An edit must invalidate the checksum even when it lands in the same
+      # second as the build before it, which is the case an mtime comparison
+      # misses and the stamp exists for.
+      - name: An edited source forces a rebuild
+        run: |
+          before=$(cat "out dir/.source-checksum")
+          printf '\n// ci probe\n' >> src/version.cpp
+          make BUILD="out dir"
+          after=$(cat "out dir/.source-checksum")
+          test "$before" != "$after"

@@ -365,4 +365,6 @@ Targets are removed in parallel, across the same worker pool the scan uses. Remo
 
 - A removal that is already in progress cannot be undone by a change made underneath it. The identity check happens once, before the walk down a matched directory begins; entries created inside that directory while it is being emptied are removed along with the rest.
 
+- The scan is not descriptor-relative the way deletion is. It queues directory paths, and opens each one by path when it reaches it. A directory that was checked and found not to be a symlink, then replaced by one before the walk or the sizing pass gets to it, is followed that once — so under concurrent modification the list and the byte totals can name entries from outside `ROOT`. Nothing is removed through that path: the walk down from `ROOT` opens every component with `O_NOFOLLOW` and refuses the changed component. The escape is also one level deep, since a symlink below it is recognised as one and not descended into.
+
 - Pointing `ROOT` directly at a protected directory scans it. The skip list applies to entries found during the walk, not to `ROOT` itself.

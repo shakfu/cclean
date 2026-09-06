@@ -97,4 +97,13 @@ if(CCLEAN_BUILD_TESTS)
     add_test(
         NAME cli
         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli.sh $<TARGET_FILE:cclean>)
+
+    # A deadlock in the worker pool, or a prompt that reads a stdin nothing
+    # closes, hangs the suite rather than failing it, and ctest waits forever
+    # by default. The budgets are set for the slowest configuration the CI
+    # runs -- both suites under ThreadSanitizer on a Debug build -- rather
+    # than for the 0.06 and 1.6 seconds they take locally, so that a timeout
+    # means a hang and never a slow machine.
+    set_tests_properties(unit PROPERTIES TIMEOUT 120)
+    set_tests_properties(cli PROPERTIES TIMEOUT 300)
 endif()
