@@ -240,7 +240,7 @@ void test_default_patterns() {
 
     const Glob cache = name_glob(".*_cache");
 
-    // .*_cache is load-bearing: it is the only entry covering the per-tool
+    // .*_cache is structural: it is the only entry covering the per-tool
     // caches, which have no named patterns of their own.
     CHECK(cache.matches(".pytest_cache"));
     CHECK(cache.matches(".mypy_cache"));
