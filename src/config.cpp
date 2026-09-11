@@ -139,8 +139,27 @@ bool load_config(const fs::path& path, Config& config, std::string& error) {
 }
 
 fs::path find_config(const fs::path& root) {
-    fs::path current = fs::absolute(root).lexically_normal();
-    if (!fs::is_directory(current)) {
+    // The non-throwing overloads, because this runs before ROOT is validated:
+    // the throwing is_directory() aborted the process on a root that cannot be
+    // searched, over the same permission error the root check reports as
+    // status 1. A root that cannot be inspected carries no configuration --
+    // falling back to its parent would read a file from a directory the user
+    // did not name. A root that does not exist is not an error here and still
+    // searches upward from its parent.
+    std::error_code ec;
+    fs::path current = fs::absolute(root, ec).lexically_normal();
+
+    if (ec) {
+        return {};
+    }
+
+    const bool directory = fs::is_directory(current, ec);
+
+    if (ec) {
+        return {};
+    }
+
+    if (!directory) {
         current = current.parent_path();
     }
 

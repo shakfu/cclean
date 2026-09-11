@@ -1,6 +1,7 @@
 #include "cclean/scan.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <iterator>
 #include <mutex>
 #include <optional>
@@ -178,37 +179,46 @@ void scan_tree(
                     continue;
                 }
 
-                Target target;
-                target.path = path;
-                target.is_directory = is_directory;
-                target.is_symlink = is_symlink;
-
                 // The one no-follow stat this target needs, taken once. It
                 // carries the identity removal re-checks after the user has
                 // reviewed the list, and for a symlink it is also where the
                 // timestamp comes from.
                 struct stat info;
-                const bool stated = ::lstat(path.c_str(), &info) == 0;
 
-                if (stated) {
-                    target.device = static_cast<std::uint64_t>(info.st_dev);
-                    target.inode = static_cast<std::uint64_t>(info.st_ino);
-                    target.has_identity = true;
+                if (::lstat(path.c_str(), &info) != 0) {
+                    // Without an identity, removal has only its type check
+                    // left, which any replacement of the same kind passes --
+                    // so an entry that cannot be stated is reported and
+                    // dropped rather than offered for deletion. The listing
+                    // above succeeding and this failing is what a path longer
+                    // than PATH_MAX does, and what an entry unlinked between
+                    // the two does.
+                    const std::error_code stat_ec(
+                        errno, std::generic_category());
+
+                    local.push_back("Cannot inspect " + path.string() + ": " +
+                                    stat_ec.message());
+                    continue;
                 }
 
-                // An unreadable mtime is recorded, not reported. It is only
-                // ever consulted by the age filter, which raises its own
-                // "Cannot apply age filter" error for the same target; warning
-                // here as well made every run without the filter exit 1 over a
-                // value it never read.
-                if (is_symlink) {
-                    target.has_time = stated;
+                Target target;
+                target.path = path;
+                target.is_directory = is_directory;
+                target.is_symlink = is_symlink;
+                target.device = static_cast<std::uint64_t>(info.st_dev);
+                target.inode = static_cast<std::uint64_t>(info.st_ino);
+                target.has_identity = true;
 
-                    if (stated) {
-                        target.newest_time = from_unix_seconds(
-                            static_cast<std::int64_t>(info.st_mtime));
-                    }
+                if (is_symlink) {
+                    target.newest_time = from_unix_seconds(
+                        static_cast<std::int64_t>(info.st_mtime));
+                    target.has_time = true;
                 } else {
+                    // An unreadable mtime is recorded, not reported. It is
+                    // only ever consulted by the age filter, which raises its
+                    // own "Cannot apply age filter" error for the same target;
+                    // warning here as well made every run without the filter
+                    // exit 1 over a value it never read.
                     std::error_code time_ec;
                     target.newest_time = entry.last_write_time(time_ec);
                     target.has_time = !time_ec;

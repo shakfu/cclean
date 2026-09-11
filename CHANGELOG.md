@@ -4,6 +4,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Fixed
+
+- An unsearchable `ROOT` aborted the process instead of exiting 1. `find_config()` runs before `main()` validates `ROOT`, and reached the throwing `fs::is_directory()`; a root whose ancestor denies search therefore terminated on an uncaught `filesystem_error`, returning SIGABRT where the exit-code table documents status 1 for a root that cannot be inspected. `fs::absolute()` was the same hazard at two more sites, and `--no-config` did not avoid it: a relative `ROOT` resolved against a working directory that had since been removed aborted the same way. All four calls now take the `error_code` overloads. A root that cannot be inspected yields no configuration rather than falling back to its parent, which would have read a file from a directory the user did not name. `main()` is wrapped in a handler that reports a `std::exception` and returns 1, so the next throwing call added below it is an exit code and not a core dump.
+
+- A target whose no-follow stat failed during the scan was offered for removal without an identity, and removal then had only its type check left -- which a directory swapped in for a directory, or a file for a file, passes. `Target::has_identity` was documented as false only for a target a caller built by hand, so the scan was breaking its own contract on an error path. It needs no race to reach: an entry whose full path exceeds `PATH_MAX` is listed by its parent and cannot be `lstat()`ed, and removal reaches it through `openat()` one component at a time, where the length limit does not apply. Such an entry is now reported as `Cannot inspect` and dropped, which exits 3 like every other unreadable thing the scan finds.
+
+### Changed
+
+- The `load_config()` comment records what loading into a `Config` does to values already in it: an omitted key leaves its member alone and an array key appends. The CLI passes a fresh `Config`, so this documents the library behaviour rather than changing it.
+
+### Added
+
+- Command-line coverage for the two aborts and for the target that cannot be stated: an unsearchable root, a removed working directory, and a `__pycache__` nested past `PATH_MAX`, which is asserted to be reported, left out of the matched list, and still present after a confirmed removal. The suite goes from 218 checks to 224. The nesting is built one relative `mkdir` at a time and skips itself where the filesystem will not take it.
+
 ## [0.2.2]
 
 ### Fixed

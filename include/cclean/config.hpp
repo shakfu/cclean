@@ -25,11 +25,16 @@ struct Config {
     std::string larger_than;
 };
 
-// Reads `path` into `config`. On failure `error` carries a
-// "file:line: message" diagnostic and nothing is guaranteed about `config`.
+// Reads `path` into `config`. A key the file omits leaves its member
+// untouched and an array key appends to the member, so a reused `Config` is
+// merged into rather than replaced; the CLI passes a fresh one. On failure
+// `error` carries a "file:line: message" diagnostic and nothing is guaranteed
+// about `config`.
 bool load_config(const fs::path& path, Config& config, std::string& error);
 
-// The nearest .cclean.toml at or above `root`, or an empty path. Entries that
+// The nearest .cclean.toml at or above `root`, or an empty path. A `root`
+// that cannot be inspected also yields an empty path: this runs before the
+// caller has validated `root`, and reports nothing itself. Entries that
 // name a directory are resolved against the file's own directory, not ROOT,
 // so a repository-level config serves every subdirectory.
 fs::path find_config(const fs::path& root);

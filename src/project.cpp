@@ -74,9 +74,24 @@ bool is_artifact_directory(
         return false;
     }
 
+    // fs::absolute() resolves against the working directory and throws when
+    // that cannot be read, which a run started from a directory since deleted
+    // does. This is called from the worker pool, which rethrows into main(); a
+    // path that cannot be resolved is treated as not a project instead.
+    std::error_code ec;
     const fs::path project =
-        normalize_directory(fs::absolute(directory.parent_path()));
-    const fs::path normalized_root = normalize_directory(fs::absolute(root));
+        normalize_directory(fs::absolute(directory.parent_path(), ec));
+
+    if (ec) {
+        return false;
+    }
+
+    const fs::path normalized_root =
+        normalize_directory(fs::absolute(root, ec));
+
+    if (ec) {
+        return false;
+    }
 
     bool configured_project = false;
     for (const fs::path& project_root : project_roots) {

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <exception>
 #include <iomanip>
 #include <iostream>
 #include <string>
@@ -265,9 +266,9 @@ void note_directory_patterns(
     }
 }
 
-}  // namespace
-
-int main(int argc, char* argv[]) {
+// The body of main(), inside the anonymous namespace so that the handler
+// below is the only thing that returns to the caller.
+int run(int argc, char* argv[]) {
     CommandLine args;
     int status = 0;
 
@@ -317,9 +318,20 @@ int main(int argc, char* argv[]) {
 
     apply_config(config, args);
 
+    // Non-throwing for the same reason as find_config(): ROOT is validated
+    // below, and it is that check which reports a working directory that no
+    // longer exists. The unresolved path stands in until then.
+    std::error_code absolute_ec;
+    const fs::path config_base = config_path.empty() ? root : config_path;
+    fs::path resolved = fs::absolute(config_base, absolute_ec);
+
+    if (absolute_ec) {
+        resolved = config_base;
+    }
+
     const fs::path config_dir = config_path.empty()
-        ? normalize_directory(fs::absolute(root))
-        : normalize_directory(fs::absolute(config_path).parent_path());
+        ? normalize_directory(resolved)
+        : normalize_directory(resolved.parent_path());
 
     ScanOptions options;
     options.skip_protected = args.use_skips;
@@ -522,4 +534,21 @@ int main(int argc, char* argv[]) {
     }
 
     return result.warnings.empty() ? 0 : exit_warnings;
+}
+
+}  // namespace
+
+int main(int argc, char* argv[]) {
+    // A throwing std::filesystem call is a failure to inspect the tree, not a
+    // crash: find_config() terminated the process on an unsearchable ROOT and
+    // fs::absolute() on a deleted working directory, both of them ordinary
+    // permission and lifetime errors that status 1 already covers. The calls
+    // themselves take the error_code overloads; this catches the next one to
+    // be added without another SIGABRT in place of an exit code.
+    try {
+        return run(argc, argv);
+    } catch (const std::exception& error) {
+        std::cerr << "cclean: " << error.what() << '\n';
+        return 1;
+    }
 }

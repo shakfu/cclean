@@ -534,6 +534,90 @@ mkdir -p "$d"
 cclean -n "$d" >/dev/null 2>&1
 check "no matches exits 0" 0 $?
 
+# The configuration search runs before ROOT is validated and used to reach the
+# throwing is_directory(), so a root that cannot be searched aborted the
+# process instead of reporting the status an uninspectable root documents.
+if unprivileged; then
+    d=$WORK/unsearchable
+    rm -rf "$d"
+    mkdir -p "$d/sub"
+    chmod 000 "$d"
+    cclean -n "$d/sub" >/dev/null 2>&1
+    check "unsearchable root exits 1" 1 $?
+    chmod 755 "$d"
+else
+    echo "  SKIP  unsearchable root: root searches it anyway"
+fi
+
+# fs::absolute() throws when the working directory a relative ROOT resolves
+# against has been removed, which is one rmdir away from any run. The
+# directory's inode outlives the name, so the scan finds it empty.
+d=$WORK/deleted-cwd
+rm -rf "$d"
+mkdir -p "$d"
+( cd "$d" && rmdir "$d" && cclean -n . >/dev/null 2>&1 )
+check "deleted working directory exits 0" 0 $?
+
+# ------------------------------------------------- target without an identity
+#
+# The scan records each target's device and inode so that removal can refuse a
+# replacement, and used to enqueue the target anyway when that stat failed --
+# leaving removal with its type check alone, which any directory swapped in for
+# a directory passes. A path longer than PATH_MAX reproduces it without a race:
+# the parent lists the entry, and lstat() on the full path cannot reach it.
+
+limit=$(getconf PATH_MAX "$WORK" 2>/dev/null)
+case ${limit:-} in
+    ''|*[!0-9]*) limit=4096 ;;
+esac
+
+d=$WORK/toolong
+parent_file=$WORK/toolong.parent
+rm -rf "$d"
+mkdir -p "$d"
+
+# Every mkdir below is relative to the directory just entered, so nothing here
+# names a path the kernel would reject. The parent lands at PATH_MAX - 8,
+# putting __pycache__ beneath it four bytes over the limit.
+(
+    cd "$d" || exit 1
+
+    while [ ${#PWD} -lt $((limit - 100)) ]; do
+        mkdir nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn || exit 1
+        cd nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn || exit 1
+    done
+
+    pad=$(printf '%*s' $((limit - 9 - ${#PWD})) '' | tr ' ' p)
+    mkdir "$pad" && cd "$pad" || exit 1
+    mkdir __pycache__ || exit 1
+    printf '%s\n' "$PWD" > "$parent_file"
+)
+
+# A filesystem that tolerates the length would make every assertion below
+# meaningless, so the reachability of the full path is what selects the test.
+unreachable=no
+if [ -s "$parent_file" ] && ! [ -d "$(cat "$parent_file")/__pycache__" ]; then
+    unreachable=yes
+fi
+
+if [ "$unreachable" = yes ]; then
+    cclean -n "$d" > "$WORK/toolong.txt" 2>&1
+    check "target that cannot be stated exits 3" 3 $?
+    check "target that cannot be stated is reported" 1 \
+          "$(grep -c 'Cannot inspect' "$WORK/toolong.txt")"
+    check "target that cannot be stated is not listed" 0 \
+          "$(grep -c 'Matched targets' "$WORK/toolong.txt")"
+
+    printf 'y' | cclean "$d" >/dev/null 2>&1
+    ( cd "$(cat "$parent_file")" && [ -d __pycache__ ] )
+    check "target that cannot be stated is not removed" 0 $?
+
+    rm -rf "$d"
+else
+    rm -rf "$d"
+    echo "  SKIP  no identity: no entry this filesystem cannot stat"
+fi
+
 # A directory the process cannot write to cannot have its children removed.
 if unprivileged; then
     d=$WORK/locked
