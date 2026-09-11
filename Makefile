@@ -4,15 +4,18 @@
 #   make                 configure and build into build/
 #   make test            build, then run both suites through ctest
 #   make install         install the binary, the library and the headers
+#   make install-bin     install the binary alone, under ~/.local by default
 #   make clean           remove build/
 #
-# Override the build directory or the install prefix on the command line:
+# Override the build directory or either install prefix on the command line:
 #
 #   make BUILD=out
 #   make install PREFIX=$HOME/.local
+#   make install-bin BIN_PREFIX=/usr/local
 
 BUILD ?= build
 PREFIX ?= /usr/local
+BIN_PREFIX ?= $(HOME)/.local
 BUILD_TYPE ?= Release
 
 # CMake's Makefile generator decides what to recompile by comparing mtimes at
@@ -31,7 +34,7 @@ BUILD_TYPE ?= Release
 # neither `sort -z` nor `xargs -0`, which are not POSIX.
 STAMP = $(BUILD)/.source-checksum
 
-.PHONY: all build test install clean
+.PHONY: all build test install install-bin clean
 
 all: build
 
@@ -55,6 +58,13 @@ test: build
 
 install: build
 	@cmake --install "$(BUILD)" --strip
+
+# The runtime component is the executable; cclean_core and the headers are the
+# development component. --prefix overrides the CMAKE_INSTALL_PREFIX the build
+# was configured with, so this needs no second build directory.
+install-bin: build
+	@cmake --install "$(BUILD)" --prefix "$(BIN_PREFIX)" \
+		--component runtime --strip
 
 clean:
 	@rm -rf "$(BUILD)"

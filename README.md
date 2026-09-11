@@ -29,15 +29,17 @@ The build is defined by `CMakeLists.txt`. The `Makefile` is a frontend over it, 
 ```text
 make                    # configure and build into build/
 make install            # install to /usr/local, stripped
+make install-bin        # install bin/cclean alone, to ~/.local
 make clean              # remove build/
 ```
 
-`make install` places three things under the prefix: `bin/cclean`, `lib/libcclean.a`, and the headers under `include/cclean/`.
+`make install` places three things under the prefix: `bin/cclean`, `lib/libcclean.a`, and the headers under `include/cclean/`. `make install-bin` installs the executable and nothing else, for using the command without the library.
 
 ```text
 cmake -S . -B build
 cmake --build build --parallel
 cmake --install build --strip
+cmake --install build --prefix ~/.local --component runtime --strip
 ```
 
 Both honour the usual overrides:
@@ -45,6 +47,7 @@ Both honour the usual overrides:
 ```text
 make BUILD=out BUILD_TYPE=Debug
 make install PREFIX=$HOME/.local
+make install-bin BIN_PREFIX=/usr/local
 ```
 
 The version reported by `cclean --version` comes from `project(... VERSION ...)` in `CMakeLists.txt`, passed to the compiler as a definition. A build made outside CMake reports `unknown`.

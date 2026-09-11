@@ -4,6 +4,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- `make install-bin` installs the executable alone, under `~/.local` unless `BIN_PREFIX` says otherwise; `make install` still installs the binary, `libcclean.a` and the headers. The split is a pair of CMake install components, `runtime` and `development`, rather than a second build directory configured with a different prefix, so `cmake --install build --component runtime` does the same thing without the Makefile.
+
+## [0.2.3]
+
 ### Fixed
 
 - An unsearchable `ROOT` aborted the process instead of exiting 1. `find_config()` runs before `main()` validates `ROOT`, and reached the throwing `fs::is_directory()`; a root whose ancestor denies search therefore terminated on an uncaught `filesystem_error`, returning SIGABRT where the exit-code table documents status 1 for a root that cannot be inspected. `fs::absolute()` was the same hazard at two more sites, and `--no-config` did not avoid it: a relative `ROOT` resolved against a working directory that had since been removed aborted the same way. All four calls now take the `error_code` overloads. A root that cannot be inspected yields no configuration rather than falling back to its parent, which would have read a file from a directory the user did not name. `main()` is wrapped in a handler that reports a `std::exception` and returns 1, so the next throwing call added below it is an exit code and not a core dump.
@@ -220,4 +226,9 @@ Glob matching is open-coded rather than translated to `std::regex`. Regex was 25
 
 A matched directory is removed whole and is not descended into, so its contents appear in neither the walk nor the listing. Counting a directory and the matched files inside it separately doubles the reported total.
 
-[0.2.1]: <https://github.com/shakfu/cclean/releases/tag/0.2.1> [0.2.0]: <https://github.com/shakfu/cclean/releases/tag/0.2.0> [0.1.1]: <https://github.com/shakfu/cclean/releases/tag/0.1.1> [0.1.0]: <https://github.com/shakfu/cclean/releases/tag/0.1.0>
+[0.2.3]: <https://github.com/shakfu/cclean/releases/tag/0.2.3>
+[0.2.2]: <https://github.com/shakfu/cclean/releases/tag/0.2.2>
+[0.2.1]: <https://github.com/shakfu/cclean/releases/tag/0.2.1>
+[0.2.0]: <https://github.com/shakfu/cclean/releases/tag/0.2.0>
+[0.1.1]: <https://github.com/shakfu/cclean/releases/tag/0.1.1>
+[0.1.0]: <https://github.com/shakfu/cclean/releases/tag/0.1.0>

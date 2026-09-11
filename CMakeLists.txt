@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(cclean
-    VERSION 0.2.2
+    VERSION 0.2.3
     DESCRIPTION "Removes build caches and editor debris from a directory tree"
     LANGUAGES CXX)
 
@@ -70,9 +70,12 @@ add_executable(cclean
 target_compile_options(cclean PRIVATE ${CCLEAN_WARNINGS})
 target_link_libraries(cclean PRIVATE cclean_core)
 
-install(TARGETS cclean RUNTIME DESTINATION bin)
-install(TARGETS cclean_core ARCHIVE DESTINATION lib)
-install(DIRECTORY include/cclean DESTINATION include)
+# Two components, so that the binary can be installed on its own:
+# `cmake --install <dir> --component runtime`. An install naming no component
+# still installs both.
+install(TARGETS cclean RUNTIME DESTINATION bin COMPONENT runtime)
+install(TARGETS cclean_core ARCHIVE DESTINATION lib COMPONENT development)
+install(DIRECTORY include/cclean DESTINATION include COMPONENT development)
 
 # ------------------------------------------------------------------ tests
 
