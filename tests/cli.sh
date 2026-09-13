@@ -571,7 +571,9 @@ case ${limit:-} in
     ''|*[!0-9]*) limit=4096 ;;
 esac
 
-d=$WORK/toolong
+# Physical, because the kernel counts a symlink's expansion against PATH_MAX:
+# macOS $TMPDIR sits under /var -> private/var, which adds 8 bytes.
+d=$(cd "$WORK" && pwd -P)/toolong
 parent_file=$WORK/toolong.parent
 rm -rf "$d"
 mkdir -p "$d"
@@ -594,9 +596,11 @@ mkdir -p "$d"
 )
 
 # A filesystem that tolerates the length would make every assertion below
-# meaningless, so the reachability of the full path is what selects the test.
+# meaningless, so a reachable parent over an unreachable full path is what
+# selects the test.
 unreachable=no
-if [ -s "$parent_file" ] && ! [ -d "$(cat "$parent_file")/__pycache__" ]; then
+if [ -s "$parent_file" ] && [ -d "$(cat "$parent_file")" ] &&
+   ! [ -d "$(cat "$parent_file")/__pycache__" ]; then
     unreachable=yes
 fi
 
@@ -1065,12 +1069,20 @@ check "the escaped names are still all listed" 3 \
 
 # JSON is defined over text, so one undecodable byte in one name used to make
 # the whole document unparseable, totals and warnings included.
-if command -v python3 >/dev/null 2>&1; then
-    touch "$d/$(printf 'bad\377').pyc"
+# APFS refuses such a name with EILSEQ, so there the check has nothing to run
+# on; tests/unit.cpp covers the encoder everywhere.
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "  SKIP  invalid name: no python3 to decode the json"
+elif ! touch "$d/$(printf 'bad\377').pyc" 2>/dev/null; then
+    echo "  SKIP  invalid name: this filesystem rejects it"
+else
     cclean -n --format json "$d" 2>/dev/null > "$WORK/names.json"
-    python3 -c 'import json,sys; json.load(open(sys.argv[1]))' "$WORK/names.json" \
-        >/dev/null 2>&1
-    check "json output stays decodable next to an invalid name" 0 $?
+    python3 -c '
+import json, sys
+paths = [t["path"] for t in json.load(open(sys.argv[1], encoding="utf-8"))["targets"]]
+sys.exit(not any(p.endswith("/bad�.pyc") for p in paths))
+' "$WORK/names.json" >/dev/null 2>&1
+    check "json output stays decodable and lists an invalid name" 0 $?
 fi
 
 # -------------------------------------------------------------- config form
