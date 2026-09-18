@@ -4,9 +4,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.2.4]
+
+### Fixed
+
+- A removal that reached a path component which had disappeared since the scan leaked a descriptor. `open_parent()` releases the one it holds on every other way out of the walk, including the symlink refusal just below it, and the `ENOENT` branch returned without doing so. That branch is not an edge case: it is what a build tool deleting a directory mid-run produces. `remove_targets()` works through a whole list, so a run over a tree being rewritten underneath it exhausted the descriptor table instead of reporting the targets it could not reach. Found while adding the walk coverage below, which now counts open descriptors across 200 refused removals.
+
+- A `ROOT` reached through a symlink exited 1 rather than being scanned. The validation in `main()` asked for a no-follow status, which reports a symlink to a directory as a symlink, and the directory check below it then rejected the path -- so the frontend refused a root the rest of the program handles, and both `README.md` and the unit suite document `ROOT` as opened by name and followed. It is followed here too rather than special-cased as a symlink that happens to resolve to a directory, because every other use of `ROOT` already follows it. A symlink to a non-directory is still status 1, and a broken one is still `Cannot inspect`.
+
 ### Added
 
 - `make install-bin` installs the executable alone, under `~/.local` unless `BIN_PREFIX` says otherwise; `make install` still installs the binary, `libcclean.a` and the headers. The split is a pair of CMake install components, `runtime` and `development`, rather than a second build directory configured with a different prefix, so `cmake --install build --component runtime` does the same thing without the Makefile.
+
+- Coverage for the interval between a reviewed target's identity check and the syscall that removes it by name, which `include/cclean/remove.hpp` documents as narrowed to two adjacent syscalls rather than closed. A thread aimed at that interval landed in it once per 800 to 2,400 attempts, so the replacement is injected through a hook in `src/removal_hooks.hpp` instead and arrives on every call. Both hooks there are null unless a test sets one, and are compiled into every build rather than guarded by a macro, so the suite exercises the code that ships.
+
+  The cases fix how far a replacement landing in the window can reach: a non-directory replacement is unlinked and reported as a success, and `AT_REMOVEDIR` refuses both a symlink and a directory holding anything, so an empty directory is the only thing the window can lose. Neither form reaches outside the tree.
+
+- Coverage for the walk itself, which moves a component while the `openat()` chain is descending it. `test_remove_refuses_symlinked_parent()` has the substitution in place before the call, so every component is opened after everything has already moved; these cases move one mid-descent, which is the state a concurrent process actually produces. A component the walk has already opened is moved out from under it and the reviewed object is still removed where it now lives, which a re-resolved path would have missed. A component not yet opened is refused when it becomes a symlink, and descended into when it becomes another directory -- the walk types components rather than identifying them, so the identity check on the target is what refuses there, and is why that check cannot be dropped for a walk that already refuses symlinks.
+
+- `tests/cli.sh` gains the symlinked-root cases. The unit suite goes from 354 checks to 394 and the command-line suite from 223 to 227.
 
 ## [0.2.3]
 

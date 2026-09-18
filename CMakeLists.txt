@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.16)
 
 project(cclean
-    VERSION 0.2.3
+    VERSION 0.2.4
     DESCRIPTION "Removes build caches and editor debris from a directory tree"
     LANGUAGES CXX)
 
@@ -85,7 +85,7 @@ if(CCLEAN_BUILD_TESTS)
     enable_testing()
 
     # The unit suite links the library and includes its public headers. It also
-    # reaches two internal headers under src/, which are part of the library
+    # reaches three internal headers under src/, which are part of the library
     # but not of its installed API.
     add_executable(cclean_unit tests/unit.cpp)
     target_include_directories(cclean_unit

@@ -16,7 +16,7 @@
 
 - [ ] **Fuzzing**: the configuration parser, the glob compiler and the numeric filter parsers all take untrusted text and none has a fuzz target. The malformed-input cases in the suites are hand-written, so they cover the shapes that were already known to be wrong.
 
-- [ ] **Deletion races are not tested**: the removal path is descriptor-relative and no-follow, but nothing in the suites actually competes with it. Proving the property needs a second process renaming components mid-run, which is inherently timing-dependent.
+- [ ] **Deletion races are tested one thread deep**: `src/removal_hooks.hpp` injects a replacement into the walk and into the interval before the final unlink, which covers both points on the path to a reviewed target. Two gaps are left. The recursion that empties a matched directory re-resolves each child name within a descriptor it holds, and nothing stands a replacement in a child's place while it does. And no test runs two removals, or a removal and a build, against one tree at once: the hooks make one process deterministic and say nothing about what two of them interleave into.
 
 ## Low
 

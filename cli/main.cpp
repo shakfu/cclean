@@ -385,7 +385,11 @@ int run(int argc, char* argv[]) {
     options.excludes = compile_excludes(args.excludes);
 
     std::error_code ec;
-    const fs::file_status root_status = fs::symlink_status(root, ec);
+    // Followed, not a no-follow query: ROOT is the one path the user typed, and
+    // the removal walk opens it by name and follows it for that reason. A
+    // no-follow status reports a symlink to a directory as a symlink, which
+    // the directory check below then rejects.
+    const fs::file_status root_status = fs::status(root, ec);
 
     if (ec) {
         std::cerr << "Cannot inspect root path: " << root.string() << ": "

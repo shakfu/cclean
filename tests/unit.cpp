@@ -14,11 +14,13 @@
 #include <string>
 #include <vector>
 
+#include <fcntl.h>
 #include <unistd.h>
 
 #include "cclean/cclean.hpp"
 
 #include "parallel.hpp"
+#include "removal_hooks.hpp"
 #include "toml.hpp"
 
 using namespace cclean;
@@ -1144,6 +1146,381 @@ void test_remove_refuses_replaced_target() {
     CHECK(!fs::exists(file));
 }
 
+// The hook installed below fires between a reviewed target's identity check
+// and the syscall that removes it by name. It renames `g_window_from` onto
+// `g_window_to`, which is the replacement a racing process would have to land
+// in the same interval, and counts its calls so that a test asserting what the
+// window exposes cannot pass by never reaching it.
+fs::path g_window_from;
+fs::path g_window_to;
+int g_window_calls = 0;
+
+void window_replace() {
+    ++g_window_calls;
+    ::rename(g_window_from.c_str(), g_window_to.c_str());
+}
+
+// rename() reports EISDIR rather than replacing a directory name with a
+// symlink, so putting one there takes the two calls a racing process would
+// have to make: drop the emptied directory, then create the link.
+void window_replace_with_symlink() {
+    ++g_window_calls;
+    ::rmdir(g_window_to.c_str());
+    ::symlink(g_window_from.c_str(), g_window_to.c_str());
+}
+
+// Arms the renaming hook for one remove_target() call. A caller wanting the
+// symlink form overwrites the hook afterwards.
+void arm_window(const fs::path& from, const fs::path& to) {
+    g_window_from = from;
+    g_window_to = to;
+    g_window_calls = 0;
+    cclean::testing::set_removal_window_hook(window_replace);
+}
+
+// The component the walk is about to descend into decides whether these fire,
+// so that a case can act at one named level and leave the others alone.
+std::string g_step_on;
+fs::path g_step_a;
+fs::path g_step_b;
+int g_step_calls = 0;
+
+void arm_step(
+    const std::string& on,
+    const fs::path& a,
+    const fs::path& b,
+    cclean::testing::WalkStepHook hook)
+{
+    g_step_on = on;
+    g_step_a = a;
+    g_step_b = b;
+    g_step_calls = 0;
+    cclean::testing::set_walk_step_hook(hook);
+}
+
+// Moves `a` to `b`, with the walk holding a descriptor somewhere inside it.
+void step_rename(const char* component) {
+    if (g_step_on != component) {
+        return;
+    }
+
+    ++g_step_calls;
+    ::rename(g_step_a.c_str(), g_step_b.c_str());
+}
+
+// Stands a symlink to `b` where the component `a` was.
+void step_symlink(const char* component) {
+    if (g_step_on != component) {
+        return;
+    }
+
+    ++g_step_calls;
+    ::rename(g_step_a.c_str(), (g_step_a.string() + "-moved").c_str());
+    ::symlink(g_step_b.c_str(), g_step_a.c_str());
+}
+
+// Stands the directory `b` where the component `a` was.
+void step_substitute(const char* component) {
+    if (g_step_on != component) {
+        return;
+    }
+
+    ++g_step_calls;
+    ::rename(g_step_a.c_str(), (g_step_a.string() + "-moved").c_str());
+    ::rename(g_step_b.c_str(), g_step_a.c_str());
+}
+
+// test_remove_refuses_symlinked_parent() above puts the substitution in place
+// before the call, which leaves the walk itself untested: every component is
+// opened before anything moves. These cases move one while it is descending,
+// which is the state a concurrent process actually produces and the last thing
+// in the removal path that nothing competed with.
+void test_remove_walk_swaps() {
+    group("remove_target walk swaps");
+
+    ScanOptions options;
+    options.patterns = compile_patterns(true, {}, {});
+
+    std::string error;
+
+    // A component the walk has already opened is moved out from under it. The
+    // descriptor does not name anything, so the descent continues and the
+    // reviewed object is removed where it now lives. This is the property
+    // stated positively: not a refusal, but a removal that a re-resolved path
+    // would have missed.
+    {
+        TempTree tree;
+        const fs::path root = tree.root();
+
+        fs::create_directories(root / "pkg" / "inner");
+        std::ofstream(root / "pkg" / "inner" / "cache.pyc") << "x";
+
+        const ScanResult scanned = scan(root, options);
+
+        CHECK_EQ(scanned.targets.size(), std::size_t{1});
+
+        arm_step("inner", root / "pkg", root / "pkg-moved", step_rename);
+
+        const bool ok = remove_target(root, scanned.targets.front(), error);
+        cclean::testing::set_walk_step_hook(nullptr);
+
+        CHECK_EQ(g_step_calls, 1);
+        CHECK(ok);
+        CHECK(!fs::exists(root / "pkg-moved" / "inner" / "cache.pyc"));
+        CHECK(fs::exists(root / "pkg-moved" / "inner"));
+    }
+
+    // A component still to be opened becomes a symlink. O_NOFOLLOW refuses it,
+    // and the refusal names the component rather than the target.
+    {
+        TempTree tree;
+        const fs::path root = tree.root();
+
+        fs::create_directories(root / "pkg" / "inner");
+        std::ofstream(root / "pkg" / "inner" / "cache.pyc") << "x";
+
+        const ScanResult scanned = scan(root, options);
+
+        CHECK_EQ(scanned.targets.size(), std::size_t{1});
+
+        // Created after the scan, so the decoy is not itself a target.
+        fs::create_directories(root / "outside");
+        std::ofstream(root / "outside" / "cache.pyc") << "keep";
+
+        arm_step("inner", root / "pkg" / "inner", root / "outside",
+                 step_symlink);
+
+        const bool ok = remove_target(root, scanned.targets.front(), error);
+        cclean::testing::set_walk_step_hook(nullptr);
+
+        CHECK_EQ(g_step_calls, 1);
+        CHECK(!ok);
+        CHECK(error.find("symlink") != std::string::npos);
+        CHECK(error.find("inner") != std::string::npos);
+        CHECK(fs::exists(root / "outside" / "cache.pyc"));
+    }
+
+    // A component still to be opened becomes a different directory. O_NOFOLLOW
+    // has nothing to say about that -- the walk checks components for being
+    // symlinks, not for identity -- so the descent goes into the replacement
+    // and the identity check on the target is what refuses. Which is why that
+    // check cannot be dropped for a walk that already refuses symlinks.
+    {
+        TempTree tree;
+        const fs::path root = tree.root();
+
+        fs::create_directories(root / "pkg" / "inner");
+        std::ofstream(root / "pkg" / "inner" / "cache.pyc") << "x";
+
+        const ScanResult scanned = scan(root, options);
+
+        CHECK_EQ(scanned.targets.size(), std::size_t{1});
+
+        fs::create_directories(root / "decoy");
+        std::ofstream(root / "decoy" / "cache.pyc") << "keep";
+
+        arm_step("inner", root / "pkg" / "inner", root / "decoy",
+                 step_substitute);
+
+        const bool ok = remove_target(root, scanned.targets.front(), error);
+        cclean::testing::set_walk_step_hook(nullptr);
+
+        CHECK_EQ(g_step_calls, 1);
+        CHECK(!ok);
+        CHECK(error.find("replaced") != std::string::npos);
+        CHECK(fs::exists(root / "pkg" / "inner" / "cache.pyc"));
+    }
+}
+
+// Descriptors that are open, counted rather than read off the lowest free one:
+// the walk releases the root descriptor on every call and held the interior
+// one, so the low end stayed free while the count climbed.
+int open_descriptors() {
+    int open = 0;
+
+    for (int fd = 0; fd < 1024; ++fd) {
+        if (::fcntl(fd, F_GETFD) != -1) {
+            ++open;
+        }
+    }
+
+    return open;
+}
+
+// An interior component that has disappeared is reported, and the descriptor
+// the level above it had already opened has to be released on the way out.
+// It was not, so every removal that reached a vanished component leaked one --
+// and remove_targets() runs a whole list, which turns a build tool deleting a
+// directory mid-run into an exhausted descriptor table.
+void test_remove_walk_releases_descriptors() {
+    group("remove_target descriptors");
+
+    TempTree tree;
+    const fs::path root = tree.root();
+
+    fs::create_directories(root / "pkg" / "gone");
+    std::ofstream(root / "pkg" / "gone" / "cache.pyc") << "x";
+
+    ScanOptions options;
+    options.patterns = compile_patterns(true, {}, {});
+
+    const ScanResult scanned = scan(root, options);
+
+    CHECK_EQ(scanned.targets.size(), std::size_t{1});
+
+    fs::remove_all(root / "pkg" / "gone");
+
+    const int before = open_descriptors();
+    std::string error;
+    bool refused_every_time = true;
+
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        if (remove_target(root, scanned.targets.front(), error)) {
+            refused_every_time = false;
+        }
+    }
+
+    CHECK(refused_every_time);
+    CHECK(error.find("disappeared") != std::string::npos);
+    CHECK_EQ(open_descriptors(), before);
+}
+
+// remove_target() confirms the entry and then names it again to remove it, and
+// <cclean/remove.hpp> documents that gap as narrowed rather than closed. What
+// the documentation does not say is how far a replacement landing in it can
+// reach. These cases pin that bound: for a non-directory the replacement is
+// removed, and for a directory AT_REMOVEDIR refuses everything but an empty
+// one. Nothing outside the tree is reachable either way. A thread cannot be
+// relied on to land in two adjacent syscalls, so the replacement is injected
+// at that point instead.
+void test_remove_window_exposure() {
+    group("remove_target window");
+
+    ScanOptions options;
+    options.patterns = compile_patterns(true, {}, {});
+
+    std::string error;
+
+    // A non-directory target: the replacement is unlinked, reported as a
+    // success, and the user never reviewed it. This is the documented cost of
+    // having no descriptor to unlink through.
+    {
+        TempTree tree;
+        const fs::path root = tree.root();
+
+        fs::create_directories(root / "pkg");
+        fs::create_directories(root / "outside");
+        std::ofstream(root / "outside" / "secret.txt") << "keep";
+        std::ofstream(root / "pkg" / "cache.pyc") << "x";
+
+        const ScanResult scanned = scan(root, options);
+
+        CHECK_EQ(scanned.targets.size(), std::size_t{1});
+        CHECK(scanned.targets.front().has_identity);
+
+        // A symlink, so the replacement fails both recorded checks rather than
+        // only the identity one: the scan saw a regular file.
+        fs::create_symlink(root / "outside" / "secret.txt",
+                           root / "pkg" / "stage");
+        arm_window(root / "pkg" / "stage", root / "pkg" / "cache.pyc");
+
+        const bool ok = remove_target(root, scanned.targets.front(), error);
+        cclean::testing::set_removal_window_hook(nullptr);
+
+        CHECK_EQ(g_window_calls, 1);
+        CHECK(ok);
+        CHECK(!fs::exists(fs::symlink_status(root / "pkg" / "cache.pyc")));
+
+        // The bound that makes it tolerable: unlinkat() removed the symlink
+        // and not what it pointed at, so a replacement cannot reach out of the
+        // tree however it is aimed.
+        CHECK(fs::exists(root / "outside" / "secret.txt"));
+    }
+
+    // A directory target replaced by a directory that is not empty. The
+    // emptying ran against the verified descriptor, so it cleared the
+    // reviewed directory; AT_REMOVEDIR then refuses the replacement.
+    {
+        TempTree tree;
+        const fs::path root = tree.root();
+
+        fs::create_directories(root / "pkg" / "__pycache__");
+        std::ofstream(root / "pkg" / "__pycache__" / "a.pyc") << "x";
+        fs::create_directories(root / "occupied" / "evidence");
+
+        const ScanResult scanned = scan(root, options);
+
+        CHECK_EQ(scanned.targets.size(), std::size_t{1});
+
+        arm_window(root / "occupied", root / "pkg" / "__pycache__");
+
+        const bool ok = remove_target(root, scanned.targets.front(), error);
+        cclean::testing::set_removal_window_hook(nullptr);
+
+        CHECK_EQ(g_window_calls, 1);
+        CHECK(!ok);
+        CHECK(error.find((root / "pkg" / "__pycache__").string()) !=
+              std::string::npos);
+        CHECK(fs::exists(root / "pkg" / "__pycache__" / "evidence"));
+    }
+
+    // A directory target replaced by a symlink. AT_REMOVEDIR refuses it, so
+    // the referent is not even the question.
+    {
+        TempTree tree;
+        const fs::path root = tree.root();
+
+        fs::create_directories(root / "pkg" / "__pycache__");
+        std::ofstream(root / "pkg" / "__pycache__" / "a.pyc") << "x";
+        fs::create_directories(root / "outside");
+        std::ofstream(root / "outside" / "secret.txt") << "keep";
+
+        const ScanResult scanned = scan(root, options);
+
+        CHECK_EQ(scanned.targets.size(), std::size_t{1});
+
+        arm_window(root / "outside", root / "pkg" / "__pycache__");
+        cclean::testing::set_removal_window_hook(window_replace_with_symlink);
+
+        const bool ok = remove_target(root, scanned.targets.front(), error);
+        cclean::testing::set_removal_window_hook(nullptr);
+
+        CHECK_EQ(g_window_calls, 1);
+        CHECK(!ok);
+
+        // The substitution has to have happened for the refusal to mean
+        // anything: rename() would have failed with EISDIR and left the
+        // reviewed directory to be removed normally.
+        CHECK(fs::is_symlink(fs::symlink_status(root / "pkg" / "__pycache__")));
+        CHECK(fs::exists(root / "outside" / "secret.txt"));
+    }
+
+    // A directory target replaced by an empty directory: the one case where
+    // the window loses something. An empty directory the replacing process had
+    // just created is removed.
+    {
+        TempTree tree;
+        const fs::path root = tree.root();
+
+        fs::create_directories(root / "pkg" / "__pycache__");
+        std::ofstream(root / "pkg" / "__pycache__" / "a.pyc") << "x";
+        fs::create_directories(root / "vacant");
+
+        const ScanResult scanned = scan(root, options);
+
+        CHECK_EQ(scanned.targets.size(), std::size_t{1});
+
+        arm_window(root / "vacant", root / "pkg" / "__pycache__");
+
+        const bool ok = remove_target(root, scanned.targets.front(), error);
+        cclean::testing::set_removal_window_hook(nullptr);
+
+        CHECK_EQ(g_window_calls, 1);
+        CHECK(ok);
+        CHECK(!fs::exists(root / "pkg" / "__pycache__"));
+    }
+}
+
 // A caller that filters or builds its own list can hand remove_targets() the
 // same subtree twice: a path repeated, two spellings of one path, or a
 // directory together with something inside it. Dispatched as they stand, two
@@ -1283,6 +1660,9 @@ int main() {
     test_remove_refuses_symlinked_parent();
     test_remove_refuses_replaced_target();
     test_remove_targets_overlapping();
+    test_remove_window_exposure();
+    test_remove_walk_swaps();
+    test_remove_walk_releases_descriptors();
 
     if (g_failures == 0) {
         std::printf("unit: %d checks passed\n", g_checks);

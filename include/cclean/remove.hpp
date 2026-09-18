@@ -42,6 +42,13 @@ namespace cclean {
 // syscall after its identity was confirmed -- narrowed to that interval rather
 // than closed, since there is no handle to unlink through.
 //
+// What lands in that interval is not held to the reviewed type either: the
+// unlink names the entry, so a symlink put there is removed like anything
+// else. Its reach stops at the parent directory. Unlinking a symlink removes
+// the link and not what it points at, and the final AT_REMOVEDIR on a
+// directory target refuses a symlink and a directory holding anything, so an
+// empty one is the only loss the interval admits.
+//
 // A Target built by hand carries no identity (`has_identity` false) and is
 // checked by type alone: it was never reviewed against a displayed list, so
 // there is nothing for a replacement to have been substituted for.

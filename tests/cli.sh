@@ -529,6 +529,31 @@ d=$(fixture not_a_dir)
 cclean -n "$d/notes.log" >/dev/null 2>&1
 check "root that is not a directory exits 1" 1 $?
 
+# ROOT is opened by name and followed, because the user typed it: the removal
+# walk documents that, and the library is tested for it. The validation here
+# asked for a no-follow status, which reports a symlink to a directory as a
+# symlink and so failed the directory check -- rejecting a root the rest of the
+# program handles. A symlink to a non-directory is still rejected, and a broken
+# one is still uninspectable.
+d=$(fixture symlinked_root)
+links=$WORK/symlinked_root_links
+mkdir -p "$links"
+ln -s "$d" "$links/to-directory"
+check "a symlinked ROOT scans what the directory scans" \
+      "$(cclean -n "$d" | grep 'to reclaim')" \
+      "$(cclean -n "$links/to-directory" | grep 'to reclaim')"
+
+cclean -n "$links/to-directory" >/dev/null 2>&1
+check "a symlinked ROOT exits 0" 0 $?
+
+ln -s "$d/notes.log" "$links/to-file"
+cclean -n "$links/to-file" >/dev/null 2>&1
+check "a ROOT symlinked to a file exits 1" 1 $?
+
+ln -s "$WORK/does-not-exist" "$links/to-nothing"
+cclean -n "$links/to-nothing" >/dev/null 2>&1
+check "a broken symlink as ROOT exits 1" 1 $?
+
 d=$WORK/empty
 mkdir -p "$d"
 cclean -n "$d" >/dev/null 2>&1

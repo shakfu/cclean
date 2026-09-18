@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "parallel.hpp"
+#include "removal_hooks.hpp"
 
 namespace cclean {
 
@@ -22,6 +23,26 @@ namespace {
 
 std::string errno_message(const fs::path& path) {
     return path.string() + ": " + std::strerror(errno);
+}
+
+// Set only by the test suite, through "removal_hooks.hpp". Null everywhere
+// else, so each costs one branch.
+testing::RemovalWindowHook g_removal_window_hook = nullptr;
+testing::WalkStepHook g_walk_step_hook = nullptr;
+
+// Called where a reviewed target has been confirmed and the syscall that
+// removes it by name has not run yet.
+void enter_removal_window() {
+    if (g_removal_window_hook != nullptr) {
+        g_removal_window_hook();
+    }
+}
+
+// Called before the openat() that descends into `component`.
+void enter_walk_step(const std::string& component) {
+    if (g_walk_step_hook != nullptr) {
+        g_walk_step_hook(component.c_str());
+    }
 }
 
 // The entries are read out in full before any of them is unlinked. Removing
@@ -102,6 +123,8 @@ int open_parent(
 
         walked /= component;
 
+        enter_walk_step(component);
+
         const int next = ::openat(parent, component.c_str(),
                                   O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
                                   O_CLOEXEC);
@@ -112,6 +135,7 @@ int open_parent(
             if (open_errno == ENOENT) {
                 error = "Target changed or disappeared: " +
                         (root / relative).string();
+                ::close(parent);
                 return -1;
             }
 
@@ -306,6 +330,8 @@ bool remove_verified_directory(
     // directory just emptied. AT_REMOVEDIR bounds what that can cost to an
     // empty directory somebody put there in the meantime: it refuses a
     // symlink, refuses a file, and refuses a directory with anything in it.
+    enter_removal_window();
+
     if (::unlinkat(parent, name.c_str(), AT_REMOVEDIR) != 0) {
         error = errno_message(target.path);
         return false;
@@ -386,6 +412,18 @@ bool covers(const std::string& outer, const std::string& inner) {
 
 }  // namespace
 
+namespace testing {
+
+void set_removal_window_hook(RemovalWindowHook hook) {
+    g_removal_window_hook = hook;
+}
+
+void set_walk_step_hook(WalkStepHook hook) {
+    g_walk_step_hook = hook;
+}
+
+}  // namespace testing
+
 bool remove_target(
     const fs::path& root,
     const Target& target,
@@ -450,6 +488,7 @@ bool remove_target(
         // between two adjacent syscalls instead of the interval a user spends
         // reading a prompt, which is the difference that matters, but it does
         // not close it.
+        enter_removal_window();
         ok = remove_entry_at(parent, name, target.path, error);
     }
 
