@@ -1166,7 +1166,7 @@ void window_replace() {
 void window_replace_with_symlink() {
     ++g_window_calls;
     ::rmdir(g_window_to.c_str());
-    ::symlink(g_window_from.c_str(), g_window_to.c_str());
+    CHECK(::symlink(g_window_from.c_str(), g_window_to.c_str()) == 0);
 }
 
 // Arms the renaming hook for one remove_target() call. A caller wanting the
@@ -1216,7 +1216,7 @@ void step_symlink(const char* component) {
 
     ++g_step_calls;
     ::rename(g_step_a.c_str(), (g_step_a.string() + "-moved").c_str());
-    ::symlink(g_step_b.c_str(), g_step_a.c_str());
+    CHECK(::symlink(g_step_b.c_str(), g_step_a.c_str()) == 0);
 }
 
 // Stands the directory `b` where the component `a` was.

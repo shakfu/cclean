@@ -32,9 +32,9 @@ jobs:
         env:
           CC: ${{ matrix.cc }}
           CXX: ${{ matrix.cxx }}
-        # -Werror here rather than in CMakeLists.txt: a new compiler version
-        # must not be able to break an ordinary local build, but a warning
-        # must not survive long enough to become normal either.
+        # -Werror here and in the Makefile rather than in CMakeLists.txt, so
+        # that a new compiler version cannot break a consumer building this
+        # project as a subdirectory.
         run: >
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
           -DCMAKE_CXX_FLAGS="-Werror"
@@ -60,7 +60,7 @@ jobs:
         run: >
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Debug
-          -DCMAKE_CXX_FLAGS="-fsanitize=${{ matrix.sanitizer }} -fno-omit-frame-pointer -g -O1"
+          -DCMAKE_CXX_FLAGS="-Werror -fsanitize=${{ matrix.sanitizer }} -fno-omit-frame-pointer -g -O1"
           -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=${{ matrix.sanitizer }}"
       - name: Build
         run: cmake --build build -j

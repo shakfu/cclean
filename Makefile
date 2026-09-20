@@ -12,11 +12,19 @@
 #   make BUILD=out
 #   make install PREFIX=$HOME/.local
 #   make install-bin BIN_PREFIX=/usr/local
+#
+# Warnings are errors here, as they are in CI. `make WERROR=` turns that off
+# for a compiler whose new diagnostic is not worth fixing first.
 
 BUILD ?= build
 PREFIX ?= /usr/local
 BIN_PREFIX ?= $(HOME)/.local
 BUILD_TYPE ?= Release
+
+# CI builds every matrix entry with -Werror, so a warning only gcc emits used
+# to reach main before anything local failed. Configuring with it here moves
+# that failure to the machine the edit was made on.
+WERROR ?= -Werror
 
 # CMake's Makefile generator decides what to recompile by comparing mtimes at
 # one-second granularity. An edit that lands in the same second as the previous
@@ -44,7 +52,8 @@ all: build
 build:
 	@cmake -S . -B "$(BUILD)" \
 		-DCMAKE_BUILD_TYPE="$(BUILD_TYPE)" \
-		-DCMAKE_INSTALL_PREFIX="$(PREFIX)"
+		-DCMAKE_INSTALL_PREFIX="$(PREFIX)" \
+		-DCMAKE_CXX_FLAGS="$(WERROR)"
 	@checksum=$$(find include src cli tests CMakeLists.txt -type f \
 		-exec cksum {} + 2>/dev/null | sort | cksum); \
 	if [ ! -f "$(STAMP)" ] || [ "$$checksum" != "$$(cat "$(STAMP)")" ]; then \
