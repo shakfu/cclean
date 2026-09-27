@@ -57,6 +57,7 @@ struct ScanResult {
 // `done` counts entries or directories respectively. Called from worker
 // threads, but serialised, so an implementation needs no locking of its own.
 // It is called on every unit of work: throttling is the caller's to decide.
+// remove_targets() takes the same type; see remove.hpp.
 using ProgressFn = std::function<void(const char* phase, std::uintmax_t done)>;
 
 // Built-ins first, then the config file, then the command line. The order is

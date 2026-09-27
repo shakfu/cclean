@@ -1,10 +1,12 @@
 #include "cclean/remove.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -45,14 +47,60 @@ void enter_walk_step(const std::string& component) {
     }
 }
 
+// Counts unlinked entries across workers. The atomic increment is per entry;
+// the serialised callback runs once per 256, since a lock per unlink would
+// contend on the path that dominates a run.
+class Tally {
+public:
+    explicit Tally(const ProgressFn& progress) : progress_(progress) {}
+
+    void add() {
+        const std::uintmax_t done =
+            count_.fetch_add(1, std::memory_order_relaxed) + 1;
+
+        if (done % 256 == 0) {
+            report(done);
+        }
+    }
+
+    void finish() { report(count_.load(std::memory_order_relaxed)); }
+
+private:
+    const ProgressFn& progress_;
+    std::atomic<std::uintmax_t> count_{0};
+    std::mutex mutex_;
+    std::uintmax_t reported_ = 0;
+
+    // A worker can reach the lock after one holding a later count, so an
+    // older count is dropped rather than drawn as a step backwards.
+    void report(std::uintmax_t done) {
+        const std::lock_guard<std::mutex> guard(mutex_);
+
+        if (done > reported_ || done == 0) {
+            reported_ = done;
+            progress_("removing", done);
+        }
+    }
+};
+
+void count_removal(Tally* tally) {
+    if (tally != nullptr) {
+        tally->add();
+    }
+}
+
 // The entries are read out in full before any of them is unlinked. Removing
 // from a directory while its stream is still open leaves the fate of the
 // not-yet-returned entries unspecified by POSIX.
+//
+// `directories`, when given, receives one flag per name: whether d_type said
+// directory. It is a hint for where to split work, never a safety check.
 bool read_directory(
     DIR* stream,
     const fs::path& shown,
     std::vector<std::string>& names,
-    std::string& error)
+    std::string& error,
+    std::vector<bool>* directories = nullptr)
 {
     bool ok = true;
 
@@ -72,6 +120,10 @@ bool read_directory(
 
         if (name != "." && name != "..") {
             names.push_back(name);
+
+            if (directories != nullptr) {
+                directories->push_back(entry->d_type == DT_DIR);
+            }
         }
     }
 
@@ -181,6 +233,7 @@ bool remove_entry_at(
     int parent,
     const std::string& name,
     const fs::path& shown,
+    Tally* tally,
     std::string& error);
 
 // Removes everything inside an open directory, through that descriptor rather
@@ -189,6 +242,7 @@ bool remove_entry_at(
 bool empty_directory(
     int directory,
     const fs::path& shown,
+    Tally* tally,
     std::string& error)
 {
     // fdopendir() takes ownership of the descriptor, and closedir() closes it,
@@ -208,7 +262,7 @@ bool empty_directory(
     if (ok) {
         for (const std::string& child : names) {
             if (!remove_entry_at(::dirfd(stream), child, shown / child,
-                                 error)) {
+                                 tally, error)) {
                 ok = false;
                 break;
             }
@@ -230,6 +284,7 @@ bool remove_entry_at(
     int parent,
     const std::string& name,
     const fs::path& shown,
+    Tally* tally,
     std::string& error)
 {
     // The unlink is attempted before anything is known about the entry, rather
@@ -240,6 +295,7 @@ bool remove_entry_at(
     // and refuses a directory outright, so there is no window between deciding
     // and acting for the two to disagree about.
     if (::unlinkat(parent, name.c_str(), 0) == 0) {
+        count_removal(tally);
         return true;
     }
 
@@ -268,13 +324,181 @@ bool remove_entry_at(
         return false;
     }
 
-    if (!empty_directory(directory, shown, error)) {
+    if (!empty_directory(directory, shown, tally, error)) {
         return false;
     }
 
     if (::unlinkat(parent, name.c_str(), AT_REMOVEDIR) != 0) {
         error = errno_message(shown);
         return false;
+    }
+
+    count_removal(tally);
+    return true;
+}
+
+// A directory opened by the split below, held until everything under it is
+// gone. `parent` is the descriptor of the held directory containing it.
+struct HeldDirectory {
+    DIR* stream;
+    int parent;
+    std::string name;
+    fs::path shown;
+};
+
+// Closes every held stream on every path out, an exception from the pool
+// included.
+struct HeldDirectories {
+    std::vector<HeldDirectory> list;
+
+    ~HeldDirectories() {
+        for (auto it = list.rbegin(); it != list.rend(); ++it) {
+            ::closedir(it->stream);
+        }
+    }
+};
+
+// One entry for a worker to remove, recursively if it is a directory.
+struct SplitJob {
+    int parent;
+    std::string name;
+    fs::path shown;
+};
+
+// empty_directory() spread across the worker pool, for one large target.
+// Removing targets in parallel leaves a single large target on one thread.
+//
+// The top levels are opened here, breadth first, until there are enough
+// subdirectories to keep the pool busy. Every entry of the last level opened
+// becomes a job for remove_entry_at(), files included: a Cargo target/ holds
+// gigabytes in flat directories like debug/deps. Workers descend only through
+// descriptors held here, so the no-follow walk is unchanged. The held
+// directories are removed deepest first once every job has finished, which
+// keeps any directory from being removed while a worker is below it.
+//
+// Takes ownership of `directory`, as empty_directory() does.
+bool empty_directory_split(
+    int directory,
+    const fs::path& shown,
+    Tally* tally,
+    std::string& error)
+{
+    // Enough subdirectories for 4 per worker; beyond that the pool balances
+    // itself. The descriptor cap stays well inside the common limit of 1024.
+    const std::size_t wanted = std::size_t{4} * worker_limit();
+    constexpr std::size_t max_held = 256;
+    constexpr int max_depth = 4;
+
+    HeldDirectories held;
+    DIR* const root_stream = ::fdopendir(directory);
+
+    if (root_stream == nullptr) {
+        error = errno_message(shown);
+        ::close(directory);
+        return false;
+    }
+
+    held.list.push_back({root_stream, -1, "", shown});
+
+    std::vector<SplitJob> jobs;
+    std::size_t level_begin = 0;
+
+    for (int depth = 1;; ++depth) {
+        const std::size_t level_end = held.list.size();
+        std::vector<SplitJob> subdirectories;
+
+        for (std::size_t i = level_begin; i < level_end; ++i) {
+            // Copied out: the list grows below, which moves its elements.
+            const int fd = ::dirfd(held.list[i].stream);
+            const fs::path here = held.list[i].shown;
+
+            std::vector<std::string> names;
+            std::vector<bool> directories;
+
+            if (!read_directory(held.list[i].stream, here, names, error,
+                                &directories)) {
+                return false;
+            }
+
+            for (std::size_t n = 0; n < names.size(); ++n) {
+                SplitJob job{fd, names[n], here / names[n]};
+                (directories[n] ? subdirectories : jobs)
+                    .push_back(std::move(job));
+            }
+        }
+
+        if (subdirectories.size() >= wanted || depth == max_depth ||
+            held.list.size() + subdirectories.size() > max_held) {
+            jobs.insert(jobs.end(),
+                        std::make_move_iterator(subdirectories.begin()),
+                        std::make_move_iterator(subdirectories.end()));
+            break;
+        }
+
+        level_begin = level_end;
+
+        for (SplitJob& candidate : subdirectories) {
+            const int next = ::openat(candidate.parent, candidate.name.c_str(),
+                                      O_RDONLY | O_DIRECTORY | O_NOFOLLOW |
+                                      O_CLOEXEC);
+            DIR* const stream = next < 0 ? nullptr : ::fdopendir(next);
+
+            // Not a directory after all, or not openable: the job's own
+            // removal decides what it is and reports any error.
+            if (stream == nullptr) {
+                if (next >= 0) {
+                    ::close(next);
+                }
+
+                jobs.push_back(std::move(candidate));
+                continue;
+            }
+
+            held.list.push_back({stream, candidate.parent,
+                                 std::move(candidate.name),
+                                 std::move(candidate.shown)});
+        }
+
+        if (held.list.size() == level_end) {
+            break;
+        }
+    }
+
+    // One slot per job, written by one worker each. The first failure in job
+    // order is reported, so the message does not depend on scheduling.
+    std::vector<std::string> errors(jobs.size());
+    std::vector<std::size_t> queue(jobs.size());
+    std::iota(queue.rbegin(), queue.rend(), std::size_t{0});
+
+    parallel_directories(
+        std::move(queue),
+        [&](std::size_t index, std::vector<std::size_t>&) {
+            const SplitJob& job = jobs[index];
+            std::string job_error;
+
+            if (!remove_entry_at(job.parent, job.name, job.shown, tally,
+                                 job_error)) {
+                errors[index] = job_error.empty() ? job.shown.string()
+                                                  : std::move(job_error);
+            }
+        });
+
+    for (std::string& message : errors) {
+        if (!message.empty()) {
+            error = std::move(message);
+            return false;
+        }
+    }
+
+    for (std::size_t i = held.list.size(); i-- > 1;) {
+        const HeldDirectory& entry = held.list[i];
+
+        if (::unlinkat(entry.parent, entry.name.c_str(), AT_REMOVEDIR) != 0) {
+            error = errno_message(entry.shown);
+            return false;
+        }
+
+        count_removal(tally);
     }
 
     return true;
@@ -289,6 +513,8 @@ bool remove_verified_directory(
     int parent,
     const std::string& name,
     const Target& target,
+    bool split,
+    Tally* tally,
     std::string& error)
 {
     const int directory = ::openat(parent, name.c_str(),
@@ -322,7 +548,11 @@ bool remove_verified_directory(
         return false;
     }
 
-    if (!empty_directory(directory, target.path, error)) {
+    const bool emptied = split
+        ? empty_directory_split(directory, target.path, tally, error)
+        : empty_directory(directory, target.path, tally, error);
+
+    if (!emptied) {
         return false;
     }
 
@@ -337,6 +567,7 @@ bool remove_verified_directory(
         return false;
     }
 
+    count_removal(tally);
     return true;
 }
 
@@ -410,6 +641,13 @@ bool covers(const std::string& outer, const std::string& inner) {
     return outer == "/" || inner[outer.size()] == '/';
 }
 
+bool remove_counted(
+    const fs::path& root,
+    const Target& target,
+    bool split,
+    Tally* tally,
+    std::string& error);
+
 }  // namespace
 
 namespace testing {
@@ -427,6 +665,18 @@ void set_walk_step_hook(WalkStepHook hook) {
 bool remove_target(
     const fs::path& root,
     const Target& target,
+    std::string& error)
+{
+    return remove_counted(root, target, false, nullptr, error);
+}
+
+namespace {
+
+bool remove_counted(
+    const fs::path& root,
+    const Target& target,
+    bool split,
+    Tally* tally,
     std::string& error)
 {
     const fs::path relative = target.path.lexically_relative(root);
@@ -479,7 +729,8 @@ bool remove_target(
     bool ok;
 
     if (is_directory) {
-        ok = remove_verified_directory(parent, name, target, error);
+        ok = remove_verified_directory(parent, name, target, split, tally,
+                                       error);
     } else {
         // For a directory the descriptor carries the identity from here on.
         // For everything else there is no such handle: unlinkat() acts on the
@@ -489,17 +740,25 @@ bool remove_target(
         // reading a prompt, which is the difference that matters, but it does
         // not close it.
         enter_removal_window();
-        ok = remove_entry_at(parent, name, target.path, error);
+        ok = remove_entry_at(parent, name, target.path, tally, error);
     }
 
     ::close(parent);
     return ok;
 }
 
+}  // namespace
+
 std::vector<RemovalResult> remove_targets(
     const fs::path& root,
-    const std::vector<Target>& targets)
+    const std::vector<Target>& targets,
+    const ProgressFn& progress,
+    bool split)
 {
+    // Below this, a target empties in a few milliseconds on one thread, and
+    // starting a pool for it costs about 0.7 ms.
+    constexpr std::uintmax_t split_threshold = 4096;
+
     std::vector<RemovalResult> results(targets.size());
 
     if (targets.empty()) {
@@ -570,24 +829,43 @@ std::vector<RemovalResult> remove_targets(
     // that ends up on one thread then removes in the order the list was
     // reviewed in, which is what a --verbose log reads best in.
     std::vector<std::size_t> queue;
+    std::vector<std::size_t> large;
     queue.reserve(targets.size());
 
     for (std::size_t i = targets.size(); i-- > 0;) {
-        if (owner[i] == i) {
-            queue.push_back(i);
+        if (owner[i] != i) {
+            continue;
         }
+
+        const bool splits = split && targets[i].entries >= split_threshold;
+        (splits ? large : queue).push_back(i);
     }
 
     // Each worker writes one distinct element of `results` and touches nothing
     // else, so there is no lock here and no merge afterwards. `children` stays
     // empty: a target is a leaf of this queue, whatever it holds underneath.
+    Tally tally(progress);
+    Tally* const counting = progress ? &tally : nullptr;
+
     parallel_directories(
         std::move(queue),
         [&](std::size_t index, std::vector<std::size_t>&) {
             RemovalResult& result = results[index];
-            result.removed =
-                remove_target(root, targets[index], result.error);
+            result.removed = remove_counted(root, targets[index], false,
+                                            counting, result.error);
         });
+
+    // One at a time, each spread across the pool by the split. Running them
+    // inside the pool above would start a pool per worker.
+    for (auto it = large.rbegin(); it != large.rend(); ++it) {
+        RemovalResult& result = results[*it];
+        result.removed =
+            remove_counted(root, targets[*it], true, counting, result.error);
+    }
+
+    if (counting != nullptr) {
+        tally.finish();
+    }
 
     // A covered target went with the one covering it, so it reports that
     // target's outcome: removed when the covering removal succeeded, and the
@@ -602,8 +880,12 @@ std::vector<RemovalResult> remove_targets(
     return results;
 }
 
-std::vector<RemovalResult> remove_targets(const ScanResult& result) {
-    return remove_targets(result.root, result.targets);
+std::vector<RemovalResult> remove_targets(
+    const ScanResult& result,
+    const ProgressFn& progress,
+    bool split)
+{
+    return remove_targets(result.root, result.targets, progress, split);
 }
 
 }  // namespace cclean

@@ -306,6 +306,7 @@ void size_directories(
         std::move(queue),
         [&](const Job& job, std::vector<Job>& children) {
             std::uintmax_t total = 0;
+            std::uintmax_t entries = 0;
             std::vector<std::string> local;
             std::optional<fs::file_time_type> newest;
 
@@ -325,6 +326,7 @@ void size_directories(
                 }
 
                 const fs::directory_entry& entry = *it;
+                ++entries;
 
                 std::error_code status_ec;
                 const bool entry_is_symlink = entry.is_symlink(status_ec);
@@ -397,6 +399,7 @@ void size_directories(
 
             Target& target = result.targets[job.target];
             target.size = saturating_add(target.size, total);
+            target.entries += entries;
             if (newest && (!target.has_time || *newest > target.newest_time)) {
                 target.newest_time = *newest;
                 target.has_time = true;

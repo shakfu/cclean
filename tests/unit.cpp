@@ -5,6 +5,7 @@
 // installed API, and the behaviour they carry -- the TOML grammar and the
 // worker pool's exception handling -- is worth a test of its own.
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -1023,6 +1024,150 @@ void test_remove_targets() {
     CHECK(!fs::exists(tree.root() / "again" / "__pycache__"));
 }
 
+// The frontend draws its removal bar against Target::entries plus one per
+// target, so the count sizing records and the count removal reports must be the
+// same unit. 600 files pass the 256-entry batch twice.
+void test_remove_progress() {
+    group("remove_targets progress");
+
+    TempTree tree;
+    const fs::path cache = tree.root() / "pkg" / "__pycache__";
+    fs::create_directories(cache / "nested");
+
+    for (int i = 0; i < 600; ++i) {
+        std::ofstream(cache / ("m" + std::to_string(i) + ".pyc")) << "x";
+    }
+
+    std::ofstream(cache / "nested" / "b.pyc") << "x";
+    std::ofstream(tree.root() / "loose.pyc") << "x";
+
+    ScanOptions options;
+    options.patterns = compile_patterns(true, {}, {});
+
+    const ScanResult scanned = scan(tree.root(), options);
+
+    CHECK_EQ(scanned.targets.size(), std::size_t{2});
+
+    std::uintmax_t expected = 0;
+
+    for (const Target& target : scanned.targets) {
+        expected += target.entries + 1;
+    }
+
+    // 602 entries below __pycache__, plus the two targets themselves.
+    CHECK_EQ(expected, std::uintmax_t{604});
+
+    std::vector<std::uintmax_t> reports;
+    bool phase_ok = true;
+
+    const std::vector<RemovalResult> results = remove_targets(
+        scanned, [&](const char* phase, std::uintmax_t done) {
+            phase_ok = phase_ok && std::string(phase) == "removing";
+            reports.push_back(done);
+        });
+
+    CHECK(results[0].removed && results[1].removed);
+    CHECK(phase_ok);
+    CHECK_EQ(reports.size(), std::size_t{3});
+    CHECK(std::is_sorted(reports.begin(), reports.end()));
+    CHECK(!reports.empty() && reports.back() == expected);
+}
+
+// A target past the split threshold is emptied across the pool from
+// descriptors held by the splitting thread. The tree has three top-level
+// directories, so the split must descend before it has enough work; a path
+// deeper than it descends; and symlinks at both levels, which must be unlinked
+// and never followed.
+void test_remove_split() {
+    group("remove_targets split");
+
+    const auto build_tree = [](const fs::path& root) {
+        fs::create_directories(root / "outside");
+        std::ofstream(root / "outside" / "keep") << "x";
+
+        const fs::path build = root / "proj" / "build";
+
+        for (int a = 0; a < 3; ++a) {
+            for (int b = 0; b < 10; ++b) {
+                const fs::path dir = build / ("a" + std::to_string(a)) /
+                                     ("b" + std::to_string(b));
+                fs::create_directories(dir);
+
+                for (int f = 0; f < 150; ++f) {
+                    std::ofstream(dir / ("f" + std::to_string(f))) << "x";
+                }
+            }
+        }
+
+        fs::create_directories(build / "a1" / "b1" / "c" / "d" / "e" / "f");
+        std::ofstream(build / "a1" / "b1" / "c" / "d" / "e" / "f" / "deep")
+            << "x";
+        std::ofstream(build / "top") << "x";
+        fs::create_directory_symlink(root / "outside", build / "out");
+        fs::create_directory_symlink(root / "outside",
+                                     build / "a0" / "b0" / "out");
+        return build;
+    };
+
+    ScanOptions options;
+    options.patterns = compile_patterns(false, {}, {"build"});
+
+    {
+        TempTree tree;
+        const fs::path build = build_tree(tree.root());
+        const ScanResult scanned = scan(tree.root(), options);
+
+        CHECK_EQ(scanned.targets.size(), std::size_t{1});
+        // 4,500 files, 33 directories, c/d/e/f, deep, top, and 2 links.
+        CHECK_EQ(scanned.targets[0].entries, std::uintmax_t{4541});
+
+        std::uintmax_t last = 0;
+        const std::vector<RemovalResult> results = remove_targets(
+            scanned, [&](const char*, std::uintmax_t done) { last = done; });
+
+        CHECK(results[0].removed);
+        CHECK(results[0].error.empty());
+        CHECK(!fs::exists(build));
+        CHECK(fs::exists(tree.root() / "outside" / "keep"));
+        CHECK_EQ(last, scanned.targets[0].entries + 1);
+    }
+
+    // split = false takes the one-thread path over the same tree.
+    {
+        TempTree tree;
+        const fs::path build = build_tree(tree.root());
+        const ScanResult scanned = scan(tree.root(), options);
+
+        CHECK(remove_targets(scanned, {}, false)[0].removed);
+        CHECK(!fs::exists(build));
+        CHECK(fs::exists(tree.root() / "outside" / "keep"));
+    }
+
+    // A failure below the split reports its own path and removes nothing
+    // outside the target.
+    {
+        TempTree tree;
+        const fs::path build = build_tree(tree.root());
+        const ScanResult scanned = scan(tree.root(), options);
+        const fs::path locked = build / "a2" / "b5";
+
+        fs::permissions(locked,
+                        fs::perms::owner_read | fs::perms::owner_exec);
+
+        const std::vector<RemovalResult> results = remove_targets(scanned);
+
+        fs::permissions(locked, fs::perms::owner_all);
+
+        // Running as root defeats the permission bits.
+        if (!results[0].removed) {
+            CHECK(results[0].error.find(locked.string()) != std::string::npos);
+            CHECK(fs::exists(locked));
+        }
+
+        CHECK(fs::exists(tree.root() / "outside" / "keep"));
+    }
+}
+
 // The no-follow property used to stop at the target's parent: that one open()
 // resolved every component of the path by name, after the scan had listed
 // them, so an interior directory replaced by a symlink in that window sent the
@@ -1657,6 +1802,8 @@ int main() {
     test_pair_array_parsing();
     test_parallel_scan_propagates_exceptions();
     test_remove_targets();
+    test_remove_progress();
+    test_remove_split();
     test_remove_refuses_symlinked_parent();
     test_remove_refuses_replaced_target();
     test_remove_targets_overlapping();

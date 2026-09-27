@@ -1,5 +1,6 @@
 #include "terminal.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
@@ -38,19 +39,54 @@ Style Style::detect(int descriptor, ColorWhen when) {
     return style;
 }
 
-void Progress::update(const char* phase, std::uintmax_t done) {
-    if (!enabled_ || ++calls_ % 256 != 0) {
-        return;
-    }
-
+bool Progress::due() {
     const auto now = std::chrono::steady_clock::now();
 
     if (now - drawn_ < std::chrono::milliseconds(80)) {
-        return;
+        return false;
     }
 
     drawn_ = now;
+    return true;
+}
+
+void Progress::update(const char* phase, std::uintmax_t done) {
+    if (!enabled_ || ++calls_ % 256 != 0 || !due()) {
+        return;
+    }
+
     draw(phase, done);
+}
+
+void Progress::update(const char* phase, std::uintmax_t done,
+                      std::uintmax_t total) {
+    if (!enabled_ || !due()) {
+        return;
+    }
+
+    if (total == 0) {
+        draw(phase, done);
+        return;
+    }
+
+    constexpr int cells = 30;
+    const double fraction =
+        std::min(1.0, static_cast<double>(done) / static_cast<double>(total));
+    const int filled = static_cast<int>(fraction * cells);
+
+    char bar[cells + 1];
+    std::memset(bar, '#', static_cast<std::size_t>(filled));
+    std::memset(bar + filled, '-', static_cast<std::size_t>(cells - filled));
+    bar[cells] = '\0';
+
+    char line[160];
+    const int written = std::snprintf(
+        line, sizeof(line), "  %s [%s] %3d%%  %llu / %llu entries", phase, bar,
+        static_cast<int>(fraction * 100),
+        static_cast<unsigned long long>(done),
+        static_cast<unsigned long long>(total));
+
+    draw(line, written);
 }
 
 void Progress::finish() {
@@ -68,7 +104,10 @@ void Progress::draw(const char* phase, std::uintmax_t done) {
     const int written = std::snprintf(line, sizeof(line), "  %s %llu",
                                       phase,
                                       static_cast<unsigned long long>(done));
+    draw(line, written);
+}
 
+void Progress::draw(const char* line, int written) {
     if (written <= 0) {
         return;
     }

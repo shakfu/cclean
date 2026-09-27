@@ -46,6 +46,9 @@ void apply_config(const Config& config, CommandLine& args) {
     if (!args.set_skips) {
         args.use_skips = config.skip_protected;
     }
+    if (!args.set_split) {
+        args.split = config.split;
+    }
     if (!args.set_excludes) {
         args.excludes = config.excludes;
     }
@@ -500,7 +503,22 @@ int run(int argc, char* argv[]) {
     // targets are independent, so they go through the same pool the scan uses.
     // The results come back in the order the list was shown in, so what is
     // printed below does not depend on which worker drew which target.
-    const std::vector<RemovalResult> removals = remove_targets(result);
+    std::uintmax_t entries = 0;
+
+    for (const Target& target : result.targets) {
+        entries = saturating_add(entries, saturating_add(target.entries, 1));
+    }
+
+    Progress removing(is_terminal(STDERR_FILENO));
+
+    const std::vector<RemovalResult> removals = remove_targets(
+        result,
+        [&removing, entries](const char* phase, std::uintmax_t done) {
+            removing.update(phase, done, entries);
+        },
+        args.split);
+
+    removing.finish();
 
     // The matched list was already shown, so only failures are named again.
     // --verbose restores the per-item log.

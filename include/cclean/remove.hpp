@@ -71,18 +71,21 @@ struct RemovalResult {
 // 270 ms end to end, which is level with what `xargs -P8 rm -rf` reaches over
 // the same targets.
 //
-// The unit of work is one target, not one directory level as it is when
-// sizing, so a run whose targets are one enormous node_modules parallelises no
-// better than the serial loop did. Emptying a single target across threads
-// means handing a directory descriptor between them and unlinking the
-// directory only once every worker below it has finished, which is a
-// dependency the flat work queue cannot express -- and this is the deletion
-// path, where the descriptor discipline is the safety property. Removing
-// several targets at once needs none of that: each opens its own parent and
-// shares nothing.
+// The unit of work is one target. A target with at least 4,096 entries
+// (Target::entries) is instead removed alone and split across the pool: one
+// thread opens its top levels through held descriptors, workers remove what
+// is below them, and the held directories are removed once every worker has
+// finished. That removed a 5.4 GB Cargo target/ in 0.11 s rather than 0.55 s.
+// A hand-built Target has no entry count and is never split. `split` false
+// removes every target on one thread, as before the split existed.
 //
 // Results are returned in the order the targets were given, so what a caller
 // prints does not depend on which worker drew which target.
+//
+// `progress` is called with phase "removing" and the count of entries
+// unlinked so far: once per 256, and once at the end. The expected total is
+// Target::entries plus one per target. The tree can change after the scan, so
+// the count can exceed it.
 //
 // The list may overlap: scan() never emits a descendant of a matched
 // directory, but a caller that built or filtered its own list can pass the
@@ -95,13 +98,18 @@ struct RemovalResult {
 // covered by it, since unlinking a symlink removes nothing underneath.
 std::vector<RemovalResult> remove_targets(
     const fs::path& root,
-    const std::vector<Target>& targets);
+    const std::vector<Target>& targets,
+    const ProgressFn& progress = {},
+    bool split = true);
 
 // The whole of a scan, which carries the root it was given: the form to prefer,
 // since a result and a root cannot be mismatched. The overload above is for a
 // caller removing a list it has filtered or built itself, which then has to
 // name the root those targets were found under.
-std::vector<RemovalResult> remove_targets(const ScanResult& result);
+std::vector<RemovalResult> remove_targets(
+    const ScanResult& result,
+    const ProgressFn& progress = {},
+    bool split = true);
 
 }  // namespace cclean
 

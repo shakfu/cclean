@@ -40,6 +40,7 @@ void print_usage(std::ostream& out, const char* program) {
         << "  -V, --version  Show the version and exit\n"
         << "  --no-defaults  Match only the patterns given on the command line\n"
         << "  --no-skip      Also descend into the skipped directories below\n"
+        << "  --no-split     Remove each target on one thread, however large\n"
         << "  --             Treat every later argument as ROOT or a pattern\n\n"
         << "Never matched or descended into, unless --no-skip is given:\n"
         << "  " << skipped_directories() << "\n\n"
@@ -134,6 +135,12 @@ bool parse_command_line(
             if (argument == "--no-skip") {
                 command_line.use_skips = false;
                 command_line.set_skips = true;
+                continue;
+            }
+
+            if (argument == "--no-split") {
+                command_line.split = false;
+                command_line.set_split = true;
                 continue;
             }
 

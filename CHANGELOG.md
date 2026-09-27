@@ -4,6 +4,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.3.0]
+
+### Added
+
+- A progress bar while removing, drawn on standard error for a terminal only. A multi-gigabyte `build/` or `target/` previously went silent between the prompt and the summary. The bar counts entries rather than bytes, because a byte count needs a `stat` per file and removal unlinks first to avoid one. The scan records `Target::entries` while sizing, and `remove_targets()` takes an optional `ProgressFn` that reports once per 256 unlinks.
+
+### Changed
+
+- A target with at least 4,096 entries is now removed across the worker pool rather than on one thread. Parallelism was per target, so a lone `build/` or `target/` used one core. Splitting at the target's first level alone does not help Cargo, where `debug/` holds 80-90% of the entries. The split therefore opens levels breadth first until it has 4 subdirectories per worker, at most 4 levels deep and 256 held descriptors. Files at the last level become jobs too, since `debug/deps` holds gigabytes in one flat directory. Workers descend only through the held descriptors, and the held directories are removed after all workers finish. Measured on ext4 over NVMe with 16 cores and warm caches: a 5.4 GB Cargo `target/` went from 0.55 s to 0.11 s, a 3.0 GB CMake `build/` from 0.26 s to 0.06 s, and 300,000 empty files from 3.4 s to 0.6 s. `--no-split`, `split = false` in `.cclean.toml`, or the new `split` argument of `remove_targets()` restores one thread per target.
+
+  A failure inside a split target no longer stops the rest of it: other workers finish their jobs, so more is removed before the target is reported as failed. The error reported is the first in job order, so it does not vary between runs.
+
+- `Target` has a new member, `entries`, so code built against 0.2.x must be recompiled.
+
+- The unit suite goes from 396 checks to 416 and the command-line suite from 227 to 234.
+
 ## [0.2.4]
 
 ### Fixed
@@ -242,6 +258,8 @@ Glob matching is open-coded rather than translated to `std::regex`. Regex was 25
 
 A matched directory is removed whole and is not descended into, so its contents appear in neither the walk nor the listing. Counting a directory and the matched files inside it separately doubles the reported total.
 
+[0.3.0]: <https://github.com/shakfu/cclean/releases/tag/0.3.0>
+[0.2.4]: <https://github.com/shakfu/cclean/releases/tag/0.2.4>
 [0.2.3]: <https://github.com/shakfu/cclean/releases/tag/0.2.3>
 [0.2.2]: <https://github.com/shakfu/cclean/releases/tag/0.2.2>
 [0.2.1]: <https://github.com/shakfu/cclean/releases/tag/0.2.1>

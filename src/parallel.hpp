@@ -15,6 +15,16 @@
 
 namespace cclean {
 
+// Past this many workers the queue is the bottleneck rather than the
+// filesystem, and on a 128-core host the count-per-core pool meant 127
+// threads for a scan with work for a handful: stacks, scheduler pressure,
+// and thread creation itself as a fresh way for a small run to fail.
+inline unsigned int worker_limit() {
+    constexpr unsigned int ceiling = 32;
+    const unsigned int cores = std::thread::hardware_concurrency();
+    return std::min(cores == 0 ? 1u : cores, ceiling);
+}
+
 // Spreads a queue of directories across all cores. A worker pops one, runs
 // `scan` on it holding no lock, and merges whatever subdirectories that turned
 // up back into the queue. `scan` is responsible for its own results and their
@@ -41,19 +51,7 @@ void parallel_directories(std::vector<Job> queue, Scan scan) {
     std::size_t active = 0;
     std::exception_ptr failure;
 
-    // Past this many workers the queue is the bottleneck rather than the
-    // filesystem, and on a 128-core host the count-per-core pool meant 127
-    // threads for a scan with work for a handful: stacks, scheduler pressure,
-    // and thread creation itself as a fresh way for a small run to fail.
-    constexpr unsigned int ceiling = 32;
-
-    unsigned int limit = std::thread::hardware_concurrency();
-
-    if (limit == 0) {
-        limit = 1;
-    }
-
-    limit = std::min(limit, ceiling);
+    const unsigned int limit = worker_limit();
 
     std::vector<std::thread> pool;
 

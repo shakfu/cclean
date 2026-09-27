@@ -189,6 +189,12 @@ d=$(fixture verbose_on)
 loud_lines=$(printf 'y' | cclean --verbose "$d" | grep -c 'removed ')
 check "verbose lists each removal" 3 "$loud_lines"
 
+d=$(fixture no_split)
+cclean -y --no-split "$d" >/dev/null 2>&1
+check "--no-split removes the targets" 0 $?
+check "--no-split removes the matched files" 0 "$(count_files "$d/pkg")"
+check "--no-split leaves the rest" 1 "$(count_files "$d/src")"
+
 # The grand total says how much, not how much of what: a dependency tree needs
 # the network to come back and a cache does not. The breakdown the JSON has
 # always carried as `stats` is printed under the total.
@@ -909,6 +915,10 @@ check "no colour when redirected" 0 \
 cclean -n "$d" >/dev/null 2>"$WORK/err.txt"
 check "no progress when stderr is a file" 0 "$(wc -c < "$WORK/err.txt" | tr -d ' ')"
 
+e=$(fixture removal-progress)
+cclean -y "$e" >/dev/null 2>"$WORK/err.txt"
+check "no removal progress when stderr is a file" 0 "$(wc -c < "$WORK/err.txt" | tr -d ' ')"
+
 check "NO_COLOR is honoured" 0 \
       "$(NO_COLOR=1 cclean -n "$d" | grep -c "$(printf '\033')")"
 
@@ -1125,6 +1135,8 @@ config_run() {
     echo $?
 }
 
+check "split = false is accepted" 0 "$(config_run 'split = false')"
+check "a non-boolean split is rejected" 2 "$(config_run 'split = "no"')"
 check "a leading comma is rejected" 2 "$(config_run 'patterns = [, "*.tmp"]')"
 check "a repeated comma is rejected" 2 "$(config_run 'patterns = ["*.a",,"*.tmp"]')"
 check "a missing comma is rejected" 2 "$(config_run 'patterns = ["*.a" "*.tmp"]')"

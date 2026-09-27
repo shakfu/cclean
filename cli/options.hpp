@@ -20,6 +20,7 @@ struct CommandLine {
     bool build_artifacts = false;
     bool dependencies = false;
     bool assume_yes = false;
+    bool split = true;
     bool format_json = false;
     ColorWhen color = ColorWhen::Auto;
 
@@ -39,6 +40,7 @@ struct CommandLine {
     bool set_build_artifacts = false;
     bool set_dependencies = false;
     bool set_skips = false;
+    bool set_split = false;
     bool set_excludes = false;
     bool set_older_than = false;
     bool set_larger_than = false;

@@ -19,6 +19,7 @@ struct Config {
     bool build_artifacts = false;
     bool dependencies = false;
     bool skip_protected = true;
+    bool split = true;
     std::vector<std::pair<std::string, std::string>> dependency_markers;
     std::vector<std::string> project_roots;
     std::string older_than;

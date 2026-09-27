@@ -104,6 +104,12 @@ bool load_config(const fs::path& path, Config& config, std::string& error) {
                         "skip_protected must be true or false";
                 return false;
             }
+        } else if (key == "split") {
+            if (!toml::parse_bool(value, config.split)) {
+                error = where(path, line_number) +
+                        "split must be true or false";
+                return false;
+            }
         } else if (key == "dependency_markers") {
             if (!toml::parse_pair_array(value, config.dependency_markers)) {
                 error = where(path, line_number) +

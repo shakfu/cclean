@@ -43,6 +43,10 @@ public:
     // few hundred calls, and the line is redrawn at most every 80 ms.
     void update(const char* phase, std::uintmax_t done);
 
+    // A bar against a known total. Only the 80 ms limit applies: the caller
+    // already reports in batches.
+    void update(const char* phase, std::uintmax_t done, std::uintmax_t total);
+
     void finish();
 
 private:
@@ -51,7 +55,9 @@ private:
     std::uintmax_t calls_ = 0;
     std::size_t width_ = 0;
 
+    bool due();
     void draw(const char* phase, std::uintmax_t done);
+    void draw(const char* line, int written);
 };
 
 // Restores the terminal on every path out, the destructor included, so an

@@ -38,6 +38,9 @@ inline const char* reason_name(Reason reason) {
 struct Target {
     fs::path path;
     std::uintmax_t size = 0;
+    // Entries below a directory target, counted while sizing. Removal progress
+    // is measured against this plus one per target.
+    std::uintmax_t entries = 0;
     bool is_directory = false;
     bool is_symlink = false;
 

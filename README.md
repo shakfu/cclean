@@ -77,7 +77,7 @@ for (const cclean::RemovalResult& removal : cclean::remove_targets(result)) {
 
 `scan()` walks the tree, sizes every matched directory, applies the age and size filters, and returns the targets sorted by path together with any paths it could not read. It takes an optional `ProgressFn`, called once per unit of work from the worker threads but serialised, so throttling is the caller's to decide.
 
-Removal resolves each target by descending from the root the scan was given, one component at a time, so it needs to know that root. A `ScanResult` carries it, which is why `remove_targets(result)` is the form to prefer: a result and a root cannot be mismatched. `remove_targets(root, targets)` and `remove_target(root, target, error)` take it explicitly, for a caller removing a list it filtered or built itself. A target must be at or below the root it is removed against; one that is not is refused rather than reached through `..`.
+Removal resolves each target by descending from the root the scan was given, one component at a time, so it needs to know that root. A `ScanResult` carries it, which is why `remove_targets(result)` is the form to prefer: a result and a root cannot be mismatched. `remove_targets(root, targets)` and `remove_target(root, target, error)` take it explicitly, for a caller removing a list it filtered or built itself. `remove_targets()` also takes an optional `ProgressFn`, called with the entries unlinked so far once per 256; `Target::entries` plus one per target is the expected total. A target must be at or below the root it is removed against; one that is not is refused rather than reached through `..`.
 
 The headers, each usable on its own:
 
@@ -105,7 +105,7 @@ make test               # or: ctest --test-dir build --output-on-failure
 
 Two suites registered with CTest, neither with a dependency of its own:
 
-- `tests/unit.cpp` links `libcclean` and covers the glob matcher, the reasons a scan reports, size formatting, saturating addition, the skip list, pattern scope, build-artifact detection, the numeric filters, output escaping, and the worker pool. It also includes two headers under `src/`, which are part of the library but not of its installed API.
+- `tests/unit.cpp` links `libcclean` and covers the glob matcher, the reasons a scan reports, size formatting, saturating addition, the skip list, pattern scope, build-artifact detection, the numeric filters, output escaping, the worker pool, removal progress, and split removal of a large target. It also includes two headers under `src/`, which are part of the library but not of its installed API.
 
 - `tests/cli.sh` drives the built binary: exit codes, what is actually deleted, confirmation handling, the skip list end to end, build artifacts, symlinks, and the shape of the output.
 
@@ -148,6 +148,7 @@ cclean --no-defaults . "build/**"         # only what is named here
 | `-V`, `--version` | Show the version and exit |
 | `--no-defaults` | Match only the patterns given on the command line |
 | `--no-skip` | Descend into the protected directories listed below |
+| `--no-split` | Remove each target on one thread, however large |
 | `--` | Treat every later argument as `ROOT` or a pattern |
 
 ### Configuration
@@ -165,6 +166,7 @@ defaults = true
 build_artifacts = false
 dependencies = false
 skip_protected = true
+split = true
 dependency_markers = [["deps", "mix.exs"], ["vendor", "composer.lock"]]
 project_roots = ["packages/api", "packages/worker"]
 older_than = "30d"
@@ -293,7 +295,7 @@ When standard input is a pipe, a character is read from it instead, so
 
 ## Output
 
-Progress appears on standard error during long scans and is erased when they finish. Nothing is drawn for the first 80 milliseconds, so quick runs stay silent. The target list goes to standard output, so redirecting it leaves a clean file.
+Progress appears on standard error during long scans and removals, and is erased when each finishes. Removal draws a bar against the entry count recorded while sizing. It counts entries rather than bytes: a byte count needs a `stat` per file, and removal avoids one. Nothing is drawn for the first 80 milliseconds, so quick runs stay silent. The target list goes to standard output, so redirecting it leaves a clean file.
 
 Colour is used for directories, totals, and failures. It is disabled automatically when output is not a terminal, and when `NO_COLOR` is set. `--color` decides for one run instead: `always` colours a pipe, `never` leaves a terminal plain, and both override `NO_COLOR`.
 
@@ -360,7 +362,7 @@ A target the library is given twice, or a directory given together with somethin
 
 Symlinks are unlinked, never followed. A symlink matched as a target removes the link itself and leaves whatever it pointed at alone.
 
-Targets are removed in parallel, across the same worker pool the scan uses. Removal is one `unlinkat` per entry and is where a run spends its time: over a 134,400-file tree with 2,400 targets, the walk, the sizing and the sort took 30 ms together and removing them took 940 ms serially, against 270 ms for the whole run now. The unit of work is one target, so a run whose targets are one very large `node_modules` gains nothing — unlike sizing, which parallelizes a single target across directory levels. Results are reported in the order the list was shown in, whichever worker removed what.
+Targets are removed in parallel, across the same worker pool the scan uses. Removal is one `unlinkat` per entry and is where a run spends its time: over a 134,400-file tree with 2,400 targets, the walk, the sizing and the sort took 30 ms together and removing them took 940 ms serially, against 270 ms for the whole run now. A target with at least 4,096 entries is split across the pool instead: its top levels are opened from one thread, and workers remove everything below them. Removing one Cargo `target/` (5.4 GB, 15,123 entries) went from 0.55 s to 0.11 s, and one CMake `build/` (3.0 GB, 6,289 entries) from 0.26 s to 0.06 s. `--no-split`, or `split = false` in `.cclean.toml`, restores one thread per target. On a failure, the split keeps removing the rest of the target, where one thread stops at the first error. Results are reported in the order the list was shown in, whichever worker removed what.
 
 ## Limitations
 
