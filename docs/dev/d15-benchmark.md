@@ -39,7 +39,7 @@ A second run gave hclean +535 ms and oclean +292 ms on Tree 1 removal. cclean va
 
 - The walk costs about 6 us per entry in hclean and 3 us in oclean. Removal costs 10 to 15 us per entry.
 - A check during removal needs no walk. Its cost is one compare per `unlinkat`, too small to measure here. A dry run would not show the refusal.
-- reclean removes Tree 1 about 6 times slower than cclean. This is unrelated to D-15.
+- reclean removed Tree 1 about 6 times slower than cclean. This is unrelated to D-15. reclean emptied one target on one thread; it now splits large targets as cclean does (reclean CHANGELOG, Unreleased).
 
 ## Not measured
 
